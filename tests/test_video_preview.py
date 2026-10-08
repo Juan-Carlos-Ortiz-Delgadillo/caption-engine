@@ -1,7 +1,12 @@
 import unittest
 
 from app.core.models import Caption, VideoMetadata, Word
-from app.ui.video_preview import _active_caption, _fit_video_rect, _format_time
+from app.ui.video_preview import (
+    _active_caption,
+    _fit_video_rect,
+    _format_time,
+    _preview_video_rect,
+)
 
 
 class VideoPreviewTests(unittest.TestCase):
@@ -25,6 +30,16 @@ class VideoPreviewTests(unittest.TestCase):
     def test_zero_sized_preview_has_empty_video_rect(self) -> None:
         rect = _fit_video_rect(0, 600, VideoMetadata(1920, 1080, 10))
         self.assertTrue(rect.isEmpty())
+
+    def test_preview_ratio_and_zoom_map_canvas_coordinates_to_source(self) -> None:
+        rect = _preview_video_rect(
+            900, 600, VideoMetadata(1920, 1080, 10), 9 / 16, 2
+        )
+        self.assertLess(rect.left(), 0)
+        self.assertAlmostEqual(rect.center().x(), 450)
+        self.assertEqual(rect.width(), 2 * _preview_video_rect(
+            900, 600, VideoMetadata(1920, 1080, 10), 9 / 16, 1
+        ).width())
 
     def test_time_label_formats_hours_when_needed(self) -> None:
         self.assertEqual(_format_time(65_000), "01:05")

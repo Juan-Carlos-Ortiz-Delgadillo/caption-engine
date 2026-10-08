@@ -77,9 +77,16 @@ class CaptionEditorService:
 
     def update_text(self, caption_id: str, text: str) -> None:
         caption = self._get_caption(caption_id)
-        tokens = text.split()
+        lines = text.splitlines() or [text]
+        tokens = [token for line in lines for token in line.split()]
         if not tokens:
             raise ValueError("El caption no puede quedar vacío.")
+        line_breaks = []
+        token_count = 0
+        for line in lines[:-1]:
+            token_count += len(line.split())
+            if 0 < token_count < len(tokens):
+                line_breaks.append(token_count - 1)
         if len(tokens) == len(caption.words):
             words = tuple(replace(word, text=token) for word, token in zip(caption.words, tokens))
         else:
@@ -93,7 +100,10 @@ class CaptionEditorService:
                 )
                 for index, token in enumerate(tokens)
             )
-        self._replace_caption(caption_id, replace(caption, words=words))
+        self._replace_caption(
+            caption_id,
+            replace(caption, words=words, line_breaks=tuple(line_breaks)),
+        )
 
     def move_caption(self, caption_id: str, x: float, y: float) -> None:
         if not isfinite(x) or not isfinite(y) or not 0 <= x <= 1 or not 0 <= y <= 1:
@@ -108,6 +118,12 @@ class CaptionEditorService:
     def set_word_spacing(self, caption_id: str, spacing: float) -> None:
         self._replace_caption(
             caption_id, replace(self._get_caption(caption_id), word_spacing=spacing)
+        )
+
+    def rotate_caption(self, caption_id: str, degrees: float) -> None:
+        self._replace_caption(
+            caption_id,
+            replace(self._get_caption(caption_id), rotation_deg=degrees),
         )
 
     def set_timing(self, caption_id: str, start: float, end: float) -> None:
@@ -128,12 +144,26 @@ class CaptionEditorService:
         left_words, right_words = caption.words[:word_index], caption.words[word_index:]
         left_end = min(caption.end, left_words[-1].end)
         right_start = max(caption.start, right_words[0].start)
-        left = replace(caption, end=left_end, words=left_words)
+        left_breaks = tuple(
+            index for index in caption.line_breaks if index < len(left_words) - 1
+        )
+        right_breaks = tuple(
+            index - word_index
+            for index in caption.line_breaks
+            if index >= word_index
+        )
+        left = replace(
+            caption,
+            end=left_end,
+            words=left_words,
+            line_breaks=left_breaks,
+        )
         right = replace(
             caption,
             caption_id=str(uuid4()),
             start=right_start,
             words=right_words,
+            line_breaks=right_breaks,
         )
         captions = list(self._project.captions)
         index = next(i for i, current in enumerate(captions) if current.caption_id == caption_id)
@@ -152,6 +182,15 @@ class CaptionEditorService:
             start=min(first.start, second.start),
             end=max(first.end, second.end),
             words=first.words + second.words,
+            line_breaks=tuple(
+                sorted(
+                    set(first.line_breaks)
+                    | {
+                        len(first.words) + index
+                        for index in second.line_breaks
+                    }
+                )
+            ),
         )
         captions[index : index + 2] = [merged]
         self._commit(replace(self._project, captions=tuple(captions), edited=True))
@@ -163,7 +202,9 @@ class CaptionEditorService:
             raise ValueError("El índice de palabra no es válido.")
         words = list(caption.words)
         words.insert(target_index, words.pop(source_index))
-        self._replace_caption(caption_id, replace(caption, words=tuple(words)))
+        self._replace_caption(
+            caption_id, replace(caption, words=tuple(words), line_breaks=())
+        )
 
     def move_word(
         self,
@@ -192,6 +233,7 @@ class CaptionEditorService:
                             start=min(word.start for word in source_words),
                             end=max(word.end for word in source_words),
                             words=source_words,
+                            line_breaks=(),
                         )
                     )
             elif caption.caption_id == target_caption_id:
@@ -201,6 +243,7 @@ class CaptionEditorService:
                         start=min(target.start, word.start),
                         end=max(target.end, word.end),
                         words=target_words,
+                        line_breaks=(),
                     )
                 )
             else:
@@ -219,7 +262,9 @@ class CaptionEditorService:
             elif words:
                 start = max(current.start, min(word.start for word in words))
                 end = min(current.end, max(word.end for word in words))
-                captions.append(replace(current, start=start, end=end, words=words))
+                captions.append(
+                    replace(current, start=start, end=end, words=words, line_breaks=())
+                )
         self._commit(replace(self._project, captions=tuple(captions), edited=True))
 
     def delete_caption(self, caption_id: str) -> None:

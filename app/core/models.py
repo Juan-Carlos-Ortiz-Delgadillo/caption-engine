@@ -70,16 +70,26 @@ class Caption:
     start: float
     end: float
     words: tuple[Word, ...]
+    line_breaks: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.words:
             raise ValueError("Un subtítulo debe contener al menos una palabra.")
         if self.start < 0 or self.end < self.start:
             raise ValueError("Los tiempos del subtítulo no son válidos.")
+        if tuple(sorted(set(self.line_breaks))) != self.line_breaks or any(
+            index < 0 or index >= len(self.words) - 1 for index in self.line_breaks
+        ):
+            raise ValueError("Los saltos de línea deben separar palabras del caption.")
 
     @property
     def text(self) -> str:
-        return " ".join(word.text for word in self.words)
+        parts = []
+        for index, word in enumerate(self.words):
+            if index:
+                parts.append("\n" if index - 1 in self.line_breaks else " ")
+            parts.append(word.text)
+        return "".join(parts)
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +119,17 @@ class CaptionStyleConfig:
     animation_duration_ms: int = 140
     fade_enabled: bool | None = None
     highlight_enabled: bool | None = None
+    bold: bool = False
+    italic: bool = False
+    underline: bool = False
+    case_mode: str = "none"
+    line_spacing: float = 0.0
+    bubble_enabled: bool = False
+    bubble_opacity: int = 100
+    bubble_padding: float = 8.0
+    blur: float = 0.0
+    glow_enabled: bool = False
+    glow_radius: float = 0.0
 
     def __post_init__(self) -> None:
         if not 8 <= self.font_size <= 240:
@@ -118,10 +139,22 @@ class CaptionStyleConfig:
             or not isfinite(self.shadow_depth)
             or self.outline_width < 0
             or self.shadow_depth < 0
+            or not isfinite(self.line_spacing)
+            or self.line_spacing < 0
+            or not isfinite(self.bubble_padding)
+            or self.bubble_padding < 0
+            or not isfinite(self.blur)
+            or self.blur < 0
+            or not isfinite(self.glow_radius)
+            or self.glow_radius < 0
             or self.margin_vertical < 0
             or self.animation_duration_ms < 0
         ):
             raise ValueError("La configuración visual contiene valores no válidos.")
+        if self.case_mode not in {"none", "upper", "lower", "capitalize"}:
+            raise ValueError("El modo de mayúsculas debe ser none, upper, lower o capitalize.")
+        if not 0 <= self.bubble_opacity <= 100:
+            raise ValueError("La opacidad de la burbuja debe estar entre 0 y 100.")
         for color in (
             self.primary_color,
             self.highlight_color,

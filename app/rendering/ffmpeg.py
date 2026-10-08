@@ -7,6 +7,7 @@ import logging
 import shutil
 import subprocess
 import tempfile
+from math import isfinite
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
@@ -21,6 +22,7 @@ class FFmpegService:
     def __init__(self, executable: str | None = None, probe: str | None = None) -> None:
         self.executable = executable or _locate_executable("ffmpeg")
         self.probe = probe or _locate_executable("ffprobe")
+        self._preview_checked = False
 
     def check(self) -> str:
         if not self.executable:
@@ -121,6 +123,53 @@ class FFmpegService:
             str(output),
         ]
         self.run(command, duration, progress)
+
+    def preview_frame(self, source: Path, subtitles: Path, seconds: float) -> bytes:
+        if not self.executable:
+            raise DependencyError("No se encontró FFmpeg. Instálalo o configura su ubicación.")
+        if not source.is_file() or not subtitles.is_file():
+            raise RenderingError("No se encontró el video o el archivo ASS de vista previa.")
+        if not isfinite(seconds) or seconds < 0:
+            raise RenderingError("La posición de la vista previa no es válida.")
+        if not self._preview_checked:
+            self.check()
+            self._preview_checked = True
+        command = [
+            self.executable,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            f"{seconds:.3f}",
+            "-i",
+            str(source),
+            "-vf",
+            f"ass=filename='{_escape_filter_path(subtitles)}'",
+            "-frames:v",
+            "1",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "png",
+            "pipe:1",
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                check=False,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RenderingError("FFmpeg no pudo generar el fotograma de vista previa.") from exc
+        if result.returncode or not result.stdout:
+            detail = result.stderr.decode("utf-8", errors="replace")[-1000:]
+            logger.error("Falló el fotograma de vista previa de FFmpeg: %s", detail)
+            raise RenderingError(
+                "FFmpeg no pudo generar el fotograma ASS de vista previa. "
+                "Comprueba el video, la fuente instalada y el registro."
+            )
+        return result.stdout
 
     def run(
         self,

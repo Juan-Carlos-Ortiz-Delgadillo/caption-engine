@@ -44,9 +44,10 @@ class CaptionEditorServiceTests(unittest.TestCase):
         self.first, self.second = self.project.captions
 
     def test_text_update_keeps_timestamps_and_original_transcript(self) -> None:
-        self.service.update_text(self.first.caption_id, "Buenas gente")
+        self.service.update_text(self.first.caption_id, "Buenas\ngente")
         updated = self.service.project.captions[0]
-        self.assertEqual(updated.text, "Buenas gente")
+        self.assertEqual(updated.text, "Buenas\ngente")
+        self.assertEqual(updated.line_breaks, (0,))
         self.assertEqual(
             [(word.start, word.end) for word in updated.words],
             [(0.0, 0.4), (0.4, 0.8)],
@@ -89,7 +90,8 @@ class CaptionEditorServiceTests(unittest.TestCase):
         self.assertEqual(self.service.project.captions[0].end, 0.8)
 
     def test_project_round_trip_and_save_keep_original_data(self) -> None:
-        self.service.update_text(self.first.caption_id, "Hola a todos")
+        self.service.update_text(self.first.caption_id, "Hola\na todos")
+        self.service.rotate_caption(self.first.caption_id, 12.5)
         restored = project_from_dict(self.service.project.to_dict())
         self.assertEqual(restored, self.service.project)
         with tempfile.TemporaryDirectory() as directory:

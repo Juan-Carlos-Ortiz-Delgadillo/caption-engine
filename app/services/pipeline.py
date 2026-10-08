@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from collections.abc import Callable
@@ -168,25 +169,13 @@ class CaptionApplicationService:
             raise RenderingError("No se pudo leer el video fuente del proyecto.")
         output_directory.mkdir(parents=True, exist_ok=True)
         captions = tuple(caption.to_caption() for caption in project.captions)
-        layouts = tuple(
-            (caption.x, caption.y, caption.scale, caption.word_spacing)
-            for caption in project.captions
-        )
         ass_path = output_directory / "captions.ass"
         srt_path = output_directory / "captions.srt"
         transcript_path = output_directory / "transcript.json"
         project_path = output_directory / "project.acs"
         video_path = output_directory / "video_captioned.mp4"
         ass_path.write_text(
-            self._ass.generate(
-                captions,
-                project.style_id,
-                project.style_config,
-                metadata.width,
-                metadata.height,
-                caption_layouts=layouts,
-            ),
-            encoding="utf-8",
+            self.editor_ass_text(project, metadata), encoding="utf-8"
         )
         srt_path.write_text(self._srt.generate(captions), encoding="utf-8")
         report("ASS y SRT exportados.", 40)
@@ -220,6 +209,40 @@ class CaptionApplicationService:
             style_config=project.style_config,
             transcription_options=project.transcription_options,
         )
+
+    def editor_ass_text(
+        self, project: CaptionEditorProject, metadata: VideoMetadata
+    ) -> str:
+        captions = tuple(caption.to_caption() for caption in project.captions)
+        layouts = tuple(
+            (
+                caption.x,
+                caption.y,
+                caption.scale,
+                caption.word_spacing,
+                caption.rotation_deg,
+            )
+            for caption in project.captions
+        )
+        return self._ass.generate(
+            captions,
+            project.style_id,
+            project.style_config,
+            metadata.width,
+            metadata.height,
+            caption_layouts=layouts,
+        )
+
+    def render_editor_preview_frame(
+        self,
+        project: CaptionEditorProject,
+        metadata: VideoMetadata,
+        seconds: float,
+    ) -> bytes:
+        with tempfile.TemporaryDirectory(prefix="caption-preview-") as directory:
+            ass_path = Path(directory) / "preview.ass"
+            ass_path.write_text(self.editor_ass_text(project, metadata), encoding="utf-8")
+            return self._ffmpeg.preview_frame(project.source_video, ass_path, seconds)
 
 
 def _safe_name(name: str) -> str:

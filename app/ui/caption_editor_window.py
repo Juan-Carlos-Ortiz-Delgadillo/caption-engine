@@ -2,19 +2,21 @@
 
 from __future__ import annotations
 
+import json
 import logging
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QTimer, Qt, Slot
 from PySide6.QtCore import QObject, QThread, Signal
-from PySide6.QtGui import QCloseEvent, QColor, QFont, QKeyEvent
+from PySide6.QtGui import QCloseEvent, QColor, QFont, QFontDatabase, QKeyEvent
 from PySide6.QtWidgets import (
     QAbstractButton,
     QCheckBox,
     QColorDialog,
     QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFontComboBox,
     QGridLayout,
     QHBoxLayout,
@@ -24,6 +26,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
+    QScrollArea,
     QSlider,
     QSpinBox,
     QTabWidget,
@@ -97,6 +100,7 @@ class CaptionEditorWindow(QMainWindow):
         self._selected_caption_id = captions[0].caption_id if captions else None
         self._selected_word_index = 0
         self._updating_controls = False
+        self._missing_font = False
         self.setWindowTitle("Caption Editor · Animated Caption Studio")
         self.setMinimumSize(1040, 680)
         self.resize(1280, 820)
@@ -129,10 +133,16 @@ class CaptionEditorWindow(QMainWindow):
         preview_layout = QVBoxLayout(preview_panel)
         preview_layout.setContentsMargins(0, 0, 0, 0)
         self._preview = VideoPreview(
-            str(self._editor.project.source_video), self._editor, metadata, preview_panel
+            str(self._editor.project.source_video),
+            self._editor,
+            metadata,
+            preview_panel,
+            frame_renderer=self._render_preview_frame,
         )
         self._preview.captionSelected.connect(self._select_caption)
         self._preview.captionMoved.connect(self._on_caption_moved)
+        self._preview.captionDeleted.connect(self._delete_caption_from_canvas)
+        self._preview.frameError.connect(self._on_preview_error)
         preview_layout.addWidget(self._preview, 1)
         timeline_header = QHBoxLayout()
         timeline_header.addWidget(QLabel("TIMELINE"))
@@ -168,9 +178,8 @@ class CaptionEditorWindow(QMainWindow):
         self._tabs.setMaximumWidth(440)
         self._tabs.addTab(self._text_tab(), "Texto")
         self._tabs.addTab(self._animation_tab(), "Animación")
-        self._tabs.addTab(self._layout_tab(), "Diseño")
-        self._tabs.addTab(self._style_tab(), "Estilo")
         self._tabs.addTab(self._tracking_tab(), "Tracking")
+        self._tabs.addTab(self._export_tab(), "Exportar")
         content.addWidget(self._tabs)
         layout.addLayout(content, 1)
         self.setCentralWidget(root)
@@ -187,7 +196,10 @@ class CaptionEditorWindow(QMainWindow):
 
     def _text_tab(self) -> QWidget:
         widget = QWidget()
-        layout = QVBoxLayout(widget)
+        outer = QVBoxLayout(widget)
+        self._text_subtabs = QTabWidget(widget)
+        basic = QWidget()
+        layout = QVBoxLayout(basic)
         layout.addWidget(QLabel("Captions"))
         self._caption_list = QListWidget()
         self._caption_list.currentRowChanged.connect(self._select_caption_row)
@@ -195,6 +207,7 @@ class CaptionEditorWindow(QMainWindow):
         layout.addWidget(QLabel("Texto"))
         self._text = QPlainTextEdit()
         self._text.setMaximumHeight(80)
+        self._text.setPlaceholderText("Default text")
         self._text.textChanged.connect(self._update_text)
         layout.addWidget(self._text)
         layout.addWidget(QLabel("Palabras · selecciona para reordenar o dividir"))
@@ -231,6 +244,15 @@ class CaptionEditorWindow(QMainWindow):
         ):
             actions.addWidget(button, index // 2, index % 2)
         layout.addLayout(actions)
+        layout.addWidget(self._style_tab())
+        layout.addWidget(self._layout_tab())
+        basic_scroll = QScrollArea()
+        basic_scroll.setWidgetResizable(True)
+        basic_scroll.setWidget(basic)
+        self._text_subtabs.addTab(basic_scroll, "Básico")
+        self._text_subtabs.addTab(self._bubble_tab(), "Burbuja")
+        self._text_subtabs.addTab(self._effects_tab(), "Efectos")
+        outer.addWidget(self._text_subtabs)
         return widget
 
     def _animation_tab(self) -> QWidget:
@@ -265,6 +287,7 @@ class CaptionEditorWindow(QMainWindow):
         self._y = self._double_spin(0, 1, 0.01, 0.82)
         self._scale = self._double_spin(0.25, 4, 0.05, 1)
         self._spacing = self._double_spin(-20, 100, 0.5, 0)
+        self._rotation = self._double_spin(-180, 180, 1, 0)
         self._start = self._double_spin(0, 100000, 0.01, 0)
         self._end = self._double_spin(0.01, 100000, 0.01, 1)
         rows = (
@@ -272,6 +295,7 @@ class CaptionEditorWindow(QMainWindow):
             ("Y normalizada", self._y),
             ("Escala", self._scale),
             ("Espaciado", self._spacing),
+            ("Rotación", self._rotation),
             ("Inicio (s)", self._start),
             ("Final (s)", self._end),
         )
@@ -283,6 +307,7 @@ class CaptionEditorWindow(QMainWindow):
         self._y.valueChanged.connect(self._update_position)
         self._scale.valueChanged.connect(self._update_scale)
         self._spacing.valueChanged.connect(self._update_spacing)
+        self._rotation.valueChanged.connect(self._update_rotation)
         self._start.valueChanged.connect(self._update_timing)
         self._end.valueChanged.connect(self._update_timing)
         layout.addWidget(QLabel("Arrastra el caption en el video para ajustar su posición."))
@@ -301,14 +326,53 @@ class CaptionEditorWindow(QMainWindow):
         self._font_size = QSpinBox()
         self._font_size.setRange(8, 240)
         self._font_size.valueChanged.connect(self._update_font_size)
+        self._font_size_slider = QSlider(Qt.Orientation.Horizontal)
+        self._font_size_slider.setRange(8, 240)
+        self._font_size_slider.valueChanged.connect(self._font_size.setValue)
+        self._font_size.valueChanged.connect(self._font_size_slider.setValue)
+        self._bold = QCheckBox("Negrita")
+        self._italic = QCheckBox("Cursiva")
+        self._underline = QCheckBox("Subrayado")
+        self._bold.toggled.connect(lambda value: self._update_style_config(bold=value))
+        self._italic.toggled.connect(lambda value: self._update_style_config(italic=value))
+        self._underline.toggled.connect(
+            lambda value: self._update_style_config(underline=value)
+        )
+        self._case = self._combo()
+        for label, value in (
+            ("Normal", "none"),
+            ("UPPER", "upper"),
+            ("lower", "lower"),
+            ("Capitalize", "capitalize"),
+        ):
+            self._case.addItem(label, value)
+        self._case.currentIndexChanged.connect(
+            lambda _index: self._update_style_config(case_mode=self._case.currentData())
+        )
+        self._line_spacing = self._double_spin(0, 100, 1, 0)
+        self._line_spacing.valueChanged.connect(
+            lambda value: self._update_style_config(line_spacing=value)
+        )
         grid = QGridLayout()
         grid.addWidget(QLabel("Preset"), 0, 0)
         grid.addWidget(self._style, 0, 1)
         grid.addWidget(QLabel("Fuente"), 1, 0)
         grid.addWidget(self._font, 1, 1)
         grid.addWidget(QLabel("Tamaño"), 2, 0)
-        grid.addWidget(self._font_size, 2, 1)
+        size_controls = QHBoxLayout()
+        size_controls.addWidget(self._font_size_slider, 1)
+        size_controls.addWidget(self._font_size)
+        grid.addLayout(size_controls, 2, 1)
+        grid.addWidget(QLabel("Caso"), 3, 0)
+        grid.addWidget(self._case, 3, 1)
+        grid.addWidget(QLabel("Interlineado"), 4, 0)
+        grid.addWidget(self._line_spacing, 4, 1)
         layout.addLayout(grid)
+        font_toggles = QHBoxLayout()
+        font_toggles.addWidget(self._bold)
+        font_toggles.addWidget(self._italic)
+        font_toggles.addWidget(self._underline)
+        layout.addLayout(font_toggles)
         self._color_buttons: dict[str, QPushButton] = {}
         for key, label in (
             ("primary_color", "Texto"),
@@ -323,6 +387,91 @@ class CaptionEditorWindow(QMainWindow):
         self._uppercase = QCheckBox("Usar mayúsculas")
         self._uppercase.toggled.connect(self._update_uppercase)
         layout.addWidget(self._uppercase)
+        save_preset = QPushButton("Guardar como preset…")
+        save_preset.clicked.connect(self._save_preset)
+        layout.addWidget(save_preset)
+        layout.addStretch(1)
+        return widget
+
+    def _bubble_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        self._bubble_enabled = QCheckBox("Activar fondo")
+        self._bubble_enabled.toggled.connect(
+            lambda value: self._update_style_config(bubble_enabled=value)
+        )
+        layout.addWidget(self._bubble_enabled)
+        bubble_color = QPushButton("Color de fondo")
+        bubble_color.clicked.connect(lambda: self._choose_color("background_color"))
+        layout.addWidget(bubble_color)
+        self._bubble_opacity = QSpinBox()
+        self._bubble_opacity.setRange(0, 100)
+        self._bubble_opacity.setSuffix(" %")
+        self._bubble_opacity.valueChanged.connect(
+            lambda value: self._update_style_config(bubble_opacity=value)
+        )
+        self._bubble_padding = self._double_spin(0, 100, 1, 8)
+        self._bubble_padding.valueChanged.connect(
+            lambda value: self._update_style_config(bubble_padding=value)
+        )
+        for label, control in (
+            ("Opacidad", self._bubble_opacity),
+            ("Relleno", self._bubble_padding),
+        ):
+            layout.addWidget(QLabel(label))
+            layout.addWidget(control)
+        layout.addWidget(QLabel("libass representa la burbuja con esquinas cuadradas."))
+        layout.addStretch(1)
+        return widget
+
+    def _effects_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        self._outline_width = self._double_spin(0, 30, 0.5, 4)
+        self._shadow_depth = self._double_spin(0, 30, 0.5, 1.5)
+        self._blur = self._double_spin(0, 20, 0.1, 0)
+        self._glow_enabled = QCheckBox("Activar resplandor")
+        self._glow_radius = self._double_spin(0, 20, 0.1, 0)
+        self._outline_width.valueChanged.connect(
+            lambda value: self._update_style_config(outline_width=value)
+        )
+        self._shadow_depth.valueChanged.connect(
+            lambda value: self._update_style_config(shadow_depth=value)
+        )
+        self._blur.valueChanged.connect(
+            lambda value: self._update_style_config(blur=value)
+        )
+        self._glow_enabled.toggled.connect(
+            lambda value: self._update_style_config(glow_enabled=value)
+        )
+        self._glow_radius.valueChanged.connect(
+            lambda value: self._update_style_config(glow_radius=value)
+        )
+        for label, control in (
+            ("Contorno", self._outline_width),
+            ("Sombra", self._shadow_depth),
+            ("Blur", self._blur),
+        ):
+            layout.addWidget(QLabel(label))
+            layout.addWidget(control)
+        layout.addWidget(self._glow_enabled)
+        layout.addWidget(QLabel("Radio del resplandor"))
+        layout.addWidget(self._glow_radius)
+        layout.addWidget(self._color_buttons["outline_color"])
+        layout.addWidget(self._color_buttons["shadow_color"])
+        layout.addStretch(1)
+        return widget
+
+    def _export_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        export = QPushButton("Exportar ASS/SRT")
+        export.clicked.connect(self._export_subtitles)
+        render = QPushButton("Renderizar MP4")
+        render.clicked.connect(self._render_video)
+        layout.addWidget(QLabel("Exporta el estilo actual sin volver a transcribir."))
+        layout.addWidget(export)
+        layout.addWidget(render)
         layout.addStretch(1)
         return widget
 
@@ -376,17 +525,42 @@ class CaptionEditorWindow(QMainWindow):
             self._y.setValue(caption.y)
             self._scale.setValue(caption.scale)
             self._spacing.setValue(caption.word_spacing)
+            self._rotation.setValue(caption.rotation_deg)
             self._start.setValue(caption.start)
             self._end.setValue(caption.end)
         else:
-            self._text.clear()
+            self._text.setPlainText("Default text")
         style = project.style_config
+        available_fonts = {
+            family.casefold() for family in QFontDatabase.families()
+        }
+        self._missing_font = style.font_family.casefold() not in available_fonts
+        self._font.setToolTip(
+            "Esta fuente no está instalada en el equipo."
+            if self._missing_font
+            else ""
+        )
         style_index = self._style.findData(project.style_id)
         if style_index >= 0:
             self._style.setCurrentIndex(style_index)
             self._animation_style.setCurrentIndex(style_index)
         self._font.setCurrentFont(QFont(style.font_family))
         self._font_size.setValue(style.font_size)
+        self._font_size_slider.setValue(style.font_size)
+        self._bold.setChecked(style.bold)
+        self._italic.setChecked(style.italic)
+        self._underline.setChecked(style.underline)
+        case_index = self._case.findData(style.case_mode)
+        self._case.setCurrentIndex(max(0, case_index))
+        self._line_spacing.setValue(style.line_spacing)
+        self._bubble_enabled.setChecked(style.bubble_enabled)
+        self._bubble_opacity.setValue(style.bubble_opacity)
+        self._bubble_padding.setValue(style.bubble_padding)
+        self._outline_width.setValue(style.outline_width)
+        self._shadow_depth.setValue(style.shadow_depth)
+        self._blur.setValue(style.blur)
+        self._glow_enabled.setChecked(style.glow_enabled)
+        self._glow_radius.setValue(style.glow_radius)
         self._uppercase.setChecked(style.uppercase)
         self._animation_duration.setValue(style.animation_duration_ms)
         behavior = StyleRegistry().get(project.style_id).behavior
@@ -563,6 +737,12 @@ class CaptionEditorWindow(QMainWindow):
             self._on_project_changed()
 
     @Slot(float)
+    def _update_rotation(self, value: float) -> None:
+        if not self._updating_controls and self._selected_caption_id:
+            self._editor.rotate_caption(self._selected_caption_id, value)
+            self._on_project_changed()
+
+    @Slot(float)
     def _update_timing(self, _value: float) -> None:
         if self._updating_controls or not self._selected_caption_id:
             return
@@ -646,6 +826,8 @@ class CaptionEditorWindow(QMainWindow):
             self._update_style_config(**{key: selected.name().upper()})
 
     def _update_style_config(self, *, style_id: str | None = None, **changes) -> None:
+        if self._updating_controls:
+            return
         project = self._editor.project
         try:
             self._editor.set_style(
@@ -658,8 +840,27 @@ class CaptionEditorWindow(QMainWindow):
             return
         self._on_project_changed()
 
+    def _save_preset(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Guardar preset de estilo", "caption-style.json", "JSON (*.json)"
+        )
+        if not path:
+            return
+        payload = {
+            "style_id": self._editor.project.style_id,
+            "style_config": asdict(self._editor.project.style_config),
+        }
+        try:
+            Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as exc:
+            logger.exception("No se pudo guardar el preset")
+            QMessageBox.critical(
+                self, "Error al guardar", f"No se pudo guardar el preset:\n{exc}"
+            )
+
     def _on_project_changed(self, *_args) -> None:
         self._timeline.refresh()
+        self._preview.refresh_frame()
         self._refresh_controls()
         self._save_status.setText("Cambios sin guardar…")
         self._save_timer.start()
@@ -672,10 +873,26 @@ class CaptionEditorWindow(QMainWindow):
             self._updating_controls = True
             self._x.setValue(caption.x)
             self._y.setValue(caption.y)
+            self._scale.setValue(caption.scale)
+            self._rotation.setValue(caption.rotation_deg)
             self._updating_controls = False
         self._timeline.refresh()
+        self._preview.refresh_frame()
         self._save_status.setText("Cambios sin guardar…")
         self._save_timer.start()
+
+    @Slot(str)
+    def _delete_caption_from_canvas(self, caption_id: str) -> None:
+        self._editor.delete_caption(caption_id)
+        captions = self._editor.project.captions
+        self._selected_caption_id = captions[0].caption_id if captions else None
+        self._selected_word_index = 0
+        self._on_project_changed()
+
+    @Slot(str)
+    def _on_preview_error(self, message: str) -> None:
+        self._save_status.setText("Vista previa ASS no disponible")
+        self._save_status.setToolTip(message)
 
     @Slot()
     def _save_project(self) -> bool:
@@ -693,6 +910,8 @@ class CaptionEditorWindow(QMainWindow):
 
     @Slot()
     def _export_subtitles(self) -> None:
+        if not self._require_installed_font():
+            return
         self._save_timer.stop()
         if not self._save_project():
             return
@@ -717,6 +936,8 @@ class CaptionEditorWindow(QMainWindow):
 
     @Slot()
     def _render_video(self) -> None:
+        if not self._require_installed_font():
+            return
         if self._render_thread is not None:
             return
         self._save_timer.stop()
@@ -741,6 +962,27 @@ class CaptionEditorWindow(QMainWindow):
         self._render_thread.finished.connect(self._render_thread.deleteLater)
         self._render_thread.finished.connect(self._on_render_finished)
         self._render_thread.start()
+
+    def _require_installed_font(self) -> bool:
+        if not self._missing_font:
+            return True
+        QMessageBox.warning(
+            self,
+            "Fuente no instalada",
+            f"La fuente «{self._editor.project.style_config.font_family}» no está "
+            "instalada. Elige una fuente disponible antes de exportar.",
+        )
+        return False
+
+    def _render_preview_frame(self, seconds: float) -> bytes:
+        if self._missing_font:
+            raise ValueError(
+                f"La fuente «{self._editor.project.style_config.font_family}» no está "
+                "instalada en este equipo."
+            )
+        return self._export_service.render_editor_preview_frame(
+            self._editor.project, self._metadata, seconds
+        )
 
     @Slot(str, int)
     def _on_render_progress(self, message: str, _percent: int) -> None:
@@ -785,6 +1027,14 @@ class CaptionEditorWindow(QMainWindow):
             self._on_project_changed()
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self._preview.is_rendering_frame:
+            QMessageBox.information(
+                self,
+                "Vista previa en curso",
+                "Espera a que termine la actualización de vista previa antes de cerrar.",
+            )
+            event.ignore()
+            return
         if self._render_thread and self._render_thread.isRunning():
             QMessageBox.information(
                 self,

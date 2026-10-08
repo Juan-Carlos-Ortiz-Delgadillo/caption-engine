@@ -14,8 +14,9 @@ faster-whisper y usa `int8` por defecto para inferencia en CPU.
   `ffmpeg -filters | grep -w ass`. Instala una compilación de FFmpeg con libass
   con `brew install ffmpeg-full` si falta. La aplicación prioriza esa variante
   completa de Homebrew sin quitar el FFmpeg estándar.
-- Espacio en disco para los modelos Whisper. Se descargan cuando faster-whisper
-  carga por primera vez el modelo seleccionado; el usuario lo inicia al generar.
+- Modelos de faster-whisper descargados previamente en la caché local. La
+  aplicación fuerza el modo sin red; prepara cada modelo en este equipo antes de
+  desconectarte.
 
 ## Instalación y ejecución
 
@@ -38,14 +39,27 @@ El SRT es para edición en herramientas como CapCut; la apariencia avanzada ASS
 se conserva al renderizar con FFmpeg y no se garantiza que CapCut importe todas
 las animaciones ASS.
 Después de generar, selecciona «Abrir editor» para reproducir el video fuente
-con captions sincronizados. El editor permite seleccionar y arrastrar captions
-en el preview, cambiar texto, dividir/unir y reordenar palabras, ajustar posición,
-escala, espaciado y timing, y modificar el preset y la tipografía. Incluye
-timeline con selección, desplazamiento y ajuste de extremos, undo/redo y guardado
-automático del proyecto `.acs`. Usa «Exportar ASS/SRT» para actualizar los
-subtítulos o «Renderizar MP4» para producir el video con la configuración editada.
-Un proyecto `.acs` guardado se puede volver a abrir con «Abrir proyecto…» sin
-repetir la transcripción.
+con captions sincronizados. La imagen del preview se regenera en un hilo de
+trabajo con el mismo archivo ASS/libass que se usa para el MP4; los errores de
+FFmpeg se notifican y el preview recurre a la vista de reproducción nativa.
+El editor permite seleccionar, mover, escalar y rotar captions con controles
+visuales, editar texto con saltos de línea, dividir/unir y reordenar palabras,
+ajustar posición, espaciado y timing, y cambiar fuente, tamaño, negrita,
+cursiva, subrayado, caso, color, burbuja, contorno, sombra, blur y animación.
+Los saltos de línea y el control de interlineado posicionan líneas separadas
+en las coordenadas PlayRes del ASS. libass no ofrece esquinas redondeadas para
+BorderStyle=3, por lo que las burbujas son cuadradas. También incluye controles
+de encuadre/zoom del preview, timeline, undo/redo y guardado automático `.acs`.
+La segmentación automática equilibra las líneas dentro del ancho máximo y evita
+terminarlas en artículos, preposiciones o conjunciones cuando hay otra opción válida.
+Los presets de estilo se pueden guardar como JSON. Usa «Exportar ASS/SRT» para
+actualizar los subtítulos o «Renderizar MP4» para producir el video editado. Un
+proyecto `.acs` guardado se puede volver a abrir sin repetir la transcripción.
+
+La app no accede a la red: faster-whisper se configura con `local_files_only`.
+Prepara en la caché local el modelo seleccionado y las fuentes del sistema antes
+de trabajar sin conexión. Los controles de relación de aspecto y zoom sólo cambian
+el encuadre del monitor de preview; no recortan el video exportado.
 
 ## Pruebas y empaquetado
 
@@ -61,13 +75,14 @@ no habilita la generación si falta alguno.
 El empaquetado produce `dist/Animated Caption Studio.app`. FFmpeg no se
 redistribuye dentro de la app: debe estar instalado en el Mac de destino;
 asegúrate de instalar `ffmpeg-full` para disponer del filtro ASS/libass.
-faster-whisper obtiene los modelos localmente al utilizarlos; su caché permanece
-en el directorio estándar de Hugging Face.
+faster-whisper sólo usa modelos que ya existan en la caché local (por defecto,
+`~/.cache/huggingface/hub`); la aplicación no intenta descargarlos ni acceder a
+la red.
 
 ## Arquitectura
 
 `app/core` contiene modelos puros; `transcription` adapta motores locales;
 `captions`, `ass` y `srt` implementan el dominio/exportación; `rendering` encapsula
 FFmpeg; `services/pipeline.py` orquesta el flujo; `ui` contiene la interfaz Qt y
-ejecuta tareas largas en un hilo separado. Los estilos se resuelven mediante un
-registro sin acoplar el motor ASS a la GUI.
+ejecuta tareas largas en hilos separados. La vista previa solicita fotogramas
+con el mismo ASS/libass usado en la exportación final.

@@ -17,7 +17,7 @@ class ASSGenerator:
         config: CaptionStyleConfig = CaptionStyleConfig(),
         width: int = 1920,
         height: int = 1080,
-        caption_layouts: tuple[tuple[float, float, float, float], ...] | None = None,
+        caption_layouts: tuple[tuple[float, ...], ...] | None = None,
     ) -> str:
         validate_captions(captions)
         if caption_layouts is not None and len(caption_layouts) != len(captions):
@@ -51,9 +51,13 @@ class ASSGenerator:
             (
                 f"Style: Default,{_ass_text(config.font_family)},{config.font_size},"
                 f"{_ass_color(config.primary_color)},{_ass_color(config.highlight_color)},"
-                f"{_ass_color(config.outline_color)},{_ass_color(config.shadow_color)},"
-                f"{-1 if style.behavior == 'highlight' else 0},0,0,0,100,100,0,0,1,"
-                f"{config.outline_width:g},{config.shadow_depth:g},{alignment},50,50,"
+                f"{_ass_color(config.outline_color)},"
+                f"{_ass_color(config.background_color, 100 - config.bubble_opacity)},"
+                f"{-1 if config.bold or style.behavior == 'highlight' else 0},"
+                f"{-1 if config.italic else 0},{-1 if config.underline else 0},0,100,100,"
+                f"0,0,{3 if config.bubble_enabled else 1},"
+                f"{max(config.outline_width, config.bubble_padding) if config.bubble_enabled else config.outline_width:g},"
+                f"{config.shadow_depth:g},{alignment},50,50,"
                 f"{margin_v},1"
             ),
             "",
@@ -62,15 +66,52 @@ class ASSGenerator:
         ]
         events: list[str] = []
         for caption_index, caption in enumerate(captions):
-            position = (
-                _position_tag(caption_layouts[caption_index], width, height)
-                if caption_layouts is not None
-                else ""
-            )
+            layout = caption_layouts[caption_index] if caption_layouts is not None else None
+            position = _position_tag(layout, width, height) if layout is not None else ""
+            effects = _effect_tag(config)
+            lines = _word_lines(caption.words, caption.line_breaks)
+            if len(lines) > 1 and config.line_spacing > 0 and layout is not None:
+                base_x, base_y, scale, spacing = layout[:4]
+                rotation = layout[4] if len(layout) == 5 else 0.0
+                line_step = (config.font_size * scale + config.line_spacing) / max(1, height)
+                positions = tuple(
+                    _position_tag(
+                        (
+                            base_x,
+                            max(
+                                0.0,
+                                min(
+                                    1.0,
+                                    base_y
+                                    + (line_index - (len(lines) - 1) / 2)
+                                    * line_step,
+                                ),
+                            ),
+                            scale,
+                            spacing,
+                            rotation,
+                        ),
+                        width,
+                        height,
+                    )
+                    for line_index in range(len(lines))
+                )
+                _append_separate_line_events(
+                    events,
+                    lines,
+                    positions,
+                    caption,
+                    style.behavior,
+                    highlight_enabled,
+                    fade_enabled,
+                    effects,
+                    config,
+                )
+                continue
             if style.behavior == "karaoke" and highlight_enabled:
-                text = _karaoke_text(caption.words, config)
+                text = _karaoke_text(caption.words, config, caption.line_breaks)
                 animation = fade_in(config.animation_duration_ms) if fade_enabled else ""
-                text = position + animation + text
+                text = position + effects + animation + text
                 events.append(_event(caption.start, caption.end, text))
             elif style.behavior == "one_word":
                 for word in caption.words:
@@ -78,44 +119,144 @@ class ASSGenerator:
                     animation = pop(config.animation_duration_ms)
                     if fade_enabled:
                         animation += fade_in(config.animation_duration_ms)
-                    text = position + animation + text
+                    text = position + effects + animation + text
                     events.append(_event(word.start, word.end, text))
             elif not highlight_enabled:
-                text = " ".join(_format_word(word.text, config) for word in caption.words)
+                text = _join_words(
+                    tuple(_format_word(word.text, config) for word in caption.words),
+                    caption.line_breaks,
+                )
                 animation = pop(config.animation_duration_ms) if style.behavior == "pop" else ""
                 if fade_enabled:
                     animation += fade_in(config.animation_duration_ms)
-                events.append(_event(caption.start, caption.end, position + animation + text))
+                events.append(_event(caption.start, caption.end, position + effects + animation + text))
             else:
                 for active_index, word in enumerate(caption.words):
                     prefix = pop(config.animation_duration_ms) if style.behavior == "pop" else ""
                     if fade_enabled:
                         prefix += fade_in(config.animation_duration_ms)
-                    text = _highlighted_text(caption.words, active_index, config)
-                    events.append(_event(word.start, word.end, position + prefix + text))
+                    text = _highlighted_text(
+                        caption.words, active_index, config, caption.line_breaks
+                    )
+                    events.append(_event(word.start, word.end, position + effects + prefix + text))
         return "\n".join((*header, *events, ""))
 
 
-def _highlighted_text(words: tuple[Word, ...], active_index: int, config: CaptionStyleConfig) -> str:
+def _append_separate_line_events(
+    events: list[str],
+    lines: tuple[tuple[int, tuple[Word, ...]], ...],
+    positions: tuple[str, ...],
+    caption: Caption,
+    behavior: str,
+    highlight_enabled: bool,
+    fade_enabled: bool,
+    effects: str,
+    config: CaptionStyleConfig,
+) -> None:
+    if behavior == "karaoke" and highlight_enabled:
+        for (start_index, words), position in zip(lines, positions):
+            text = _karaoke_text(words, config)
+            animation = fade_in(config.animation_duration_ms) if fade_enabled else ""
+            events.append(
+                _event(caption.start, caption.end, position + effects + animation + text)
+            )
+    elif behavior == "one_word":
+        for (start_index, words), position in zip(lines, positions):
+            for word in words:
+                animation = pop(config.animation_duration_ms)
+                if fade_enabled:
+                    animation += fade_in(config.animation_duration_ms)
+                events.append(
+                    _event(
+                        word.start,
+                        word.end,
+                        position + effects + animation + _format_word(word.text, config),
+                    )
+                )
+    elif not highlight_enabled:
+        for (_, words), position in zip(lines, positions):
+            text = " ".join(_format_word(word.text, config) for word in words)
+            animation = pop(config.animation_duration_ms) if behavior == "pop" else ""
+            if fade_enabled:
+                animation += fade_in(config.animation_duration_ms)
+            events.append(
+                _event(caption.start, caption.end, position + effects + animation + text)
+            )
+    else:
+        for active_index, active_word in enumerate(caption.words):
+            for (start_index, words), position in zip(lines, positions):
+                local_index = active_index - start_index
+                line_active_index = (
+                    local_index if 0 <= local_index < len(words) else None
+                )
+                text = _highlighted_text(words, line_active_index, config)
+                prefix = pop(config.animation_duration_ms) if behavior == "pop" else ""
+                if fade_enabled:
+                    prefix += fade_in(config.animation_duration_ms)
+                events.append(
+                    _event(
+                        active_word.start,
+                        active_word.end,
+                        position + effects + prefix + text,
+                    )
+                )
+
+
+def _word_lines(
+    words: tuple[Word, ...], line_breaks: tuple[int, ...]
+) -> tuple[tuple[int, tuple[Word, ...]], ...]:
+    lines = []
+    start = 0
+    for break_after in (*line_breaks, len(words) - 1):
+        end = break_after + 1
+        lines.append((start, words[start:end]))
+        start = end
+    return tuple(lines)
+
+
+def _highlighted_text(
+    words: tuple[Word, ...],
+    active_index: int | None,
+    config: CaptionStyleConfig,
+    line_breaks: tuple[int, ...] = (),
+) -> str:
     parts = []
     for index, word in enumerate(words):
         value = _format_word(word.text, config)
         if index == active_index:
             value = r"{\1c" + _ass_color(config.highlight_color) + "}" + value + r"{\r}"
         parts.append(value)
-    return " ".join(parts)
+    return _join_words(tuple(parts), line_breaks)
 
 
-def _karaoke_text(words: tuple[Word, ...], config: CaptionStyleConfig) -> str:
+def _karaoke_text(
+    words: tuple[Word, ...],
+    config: CaptionStyleConfig,
+    line_breaks: tuple[int, ...] = (),
+) -> str:
     parts = []
     for word in words:
         duration = max(1, round((word.end - word.start) * 100))
         parts.append(r"{\k" + str(duration) + "}" + _format_word(word.text, config))
-    return " ".join(parts)
+    return _join_words(tuple(parts), line_breaks)
+
+
+def _join_words(words: tuple[str, ...], line_breaks: tuple[int, ...]) -> str:
+    parts = []
+    for index, word in enumerate(words):
+        if index:
+            parts.append(r"\N" if index - 1 in line_breaks else " ")
+        parts.append(word)
+    return "".join(parts)
 
 
 def _format_word(text: str, config: CaptionStyleConfig) -> str:
-    text = text.upper() if config.uppercase else text
+    if config.uppercase or config.case_mode == "upper":
+        text = text.upper()
+    elif config.case_mode == "lower":
+        text = text.lower()
+    elif config.case_mode == "capitalize":
+        text = text.title()
     return text.replace("\\", r"\\").replace("{", r"\{").replace("}", r"\}")
 
 
@@ -131,9 +272,10 @@ def _ass_time(seconds: float) -> str:
     return f"{hours}:{minutes:02}:{whole_seconds:02}.{centiseconds:02}"
 
 
-def _ass_color(color: str) -> str:
+def _ass_color(color: str, alpha: int = 0) -> str:
     red, green, blue = color[1:3], color[3:5], color[5:7]
-    return f"&H00{blue}{green}{red}".upper()
+    alpha_byte = max(0, min(255, round(alpha * 255 / 100)))
+    return f"&H{alpha_byte:02X}{blue}{green}{red}".upper()
 
 
 def _ass_text(value: str) -> str:
@@ -141,13 +283,16 @@ def _ass_text(value: str) -> str:
 
 
 def _position_tag(
-    layout: tuple[float, float, float, float], width: int, height: int
+    layout: tuple[float, ...], width: int, height: int
 ) -> str:
     from math import isfinite
 
     if not all(isfinite(value) for value in layout):
         raise ValueError("El layout del caption debe contener valores finitos.")
-    x, y, scale, spacing = layout
+    if len(layout) not in {4, 5}:
+        raise ValueError("El layout requiere posición, escala, espaciado y rotación opcional.")
+    x, y, scale, spacing = layout[:4]
+    rotation = layout[4] if len(layout) == 5 else 0.0
     if not 0 <= x <= 1 or not 0 <= y <= 1 or not 0.25 <= scale <= 4:
         raise ValueError("La posición o escala del caption no es válida.")
     return (
@@ -159,5 +304,11 @@ def _position_tag(
         + f"{round(scale * 100)}"
         + r"\fsp"
         + f"{spacing:g}"
+        + (r"\frz" + f"{rotation:g}" if rotation else "")
         + "}"
     )
+
+
+def _effect_tag(config: CaptionStyleConfig) -> str:
+    blur = max(config.blur, config.glow_radius if config.glow_enabled else 0.0)
+    return r"{\blur" + f"{blur:g}" + "}" if blur > 0 else ""

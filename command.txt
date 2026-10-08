@@ -1,0 +1,1 @@
+cd /Users/juanortiz/Downloads/subtitulos && .venv/bin/python -m app.main

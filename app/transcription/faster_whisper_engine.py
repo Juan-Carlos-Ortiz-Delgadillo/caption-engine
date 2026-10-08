@@ -36,7 +36,10 @@ class FasterWhisperEngine(TranscriptionEngine):
             model = self._models.get(key)
             if model is None:
                 model = WhisperModel(
-                    options.model, device=options.device, compute_type=options.compute_type
+                    options.model,
+                    device=options.device,
+                    compute_type=options.compute_type,
+                    local_files_only=True,
                 )
                 self._models[key] = model
             segments, info = model.transcribe(
@@ -94,5 +97,6 @@ class FasterWhisperEngine(TranscriptionEngine):
             )
             raise TranscriptionError(
                 f"No se pudo cargar el modelo «{options.model}» o transcribir el video. "
-                "Revisa tu conexión si el modelo aún no se descargó y el espacio disponible."
+                "Esta aplicación funciona sin conexión: descarga el modelo en este equipo "
+                "antes de desconectarte y comprueba que siga en la caché local."
             ) from exc

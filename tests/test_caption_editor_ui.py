@@ -80,7 +80,8 @@ class CaptionEditorWindowTests(unittest.TestCase):
             window.show()
             self.application.processEvents()
 
-            self.assertEqual(window._tabs.count(), 5)
+            self.assertEqual(window._tabs.count(), 4)
+            self.assertEqual(window._text_subtabs.count(), 3)
             window._text.setPlainText("Hola gente aquí")
             self.application.processEvents()
             self.assertEqual(editor.project.captions[0].text, "Hola gente aquí")
