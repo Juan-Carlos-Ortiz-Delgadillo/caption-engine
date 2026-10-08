@@ -37,6 +37,15 @@ del proyecto) en `~/Movies/Animated Caption Studio/<nombre-del-video>/`.
 El SRT es para edición en herramientas como CapCut; la apariencia avanzada ASS
 se conserva al renderizar con FFmpeg y no se garantiza que CapCut importe todas
 las animaciones ASS.
+Después de generar, selecciona «Abrir editor» para reproducir el video fuente
+con captions sincronizados. El editor permite seleccionar y arrastrar captions
+en el preview, cambiar texto, dividir/unir y reordenar palabras, ajustar posición,
+escala, espaciado y timing, y modificar el preset y la tipografía. Incluye
+timeline con selección, desplazamiento y ajuste de extremos, undo/redo y guardado
+automático del proyecto `.acs`. Usa «Exportar ASS/SRT» para actualizar los
+subtítulos o «Renderizar MP4» para producir el video con la configuración editada.
+Un proyecto `.acs` guardado se puede volver a abrir con «Abrir proyecto…» sin
+repetir la transcripción.
 
 ## Pruebas y empaquetado
 

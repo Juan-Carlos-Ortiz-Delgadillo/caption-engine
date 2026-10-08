@@ -17,9 +17,22 @@ class ASSGenerator:
         config: CaptionStyleConfig = CaptionStyleConfig(),
         width: int = 1920,
         height: int = 1080,
+        caption_layouts: tuple[tuple[float, float, float, float], ...] | None = None,
     ) -> str:
         validate_captions(captions)
+        if caption_layouts is not None and len(caption_layouts) != len(captions):
+            raise ValueError("Debe proporcionarse una posición para cada caption.")
         style = self._registry.get(style_id)
+        highlight_enabled = (
+            config.highlight_enabled
+            if config.highlight_enabled is not None
+            else style.behavior != "one_word"
+        )
+        fade_enabled = (
+            config.fade_enabled
+            if config.fade_enabled is not None
+            else style.behavior == "karaoke"
+        )
         alignment = {"bottom": 2, "center": 5, "top": 8}[config.position]
         margin_v = config.margin_vertical
         header = [
@@ -48,21 +61,38 @@ class ASSGenerator:
             "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
         ]
         events: list[str] = []
-        for caption in captions:
-            if style.behavior == "karaoke":
+        for caption_index, caption in enumerate(captions):
+            position = (
+                _position_tag(caption_layouts[caption_index], width, height)
+                if caption_layouts is not None
+                else ""
+            )
+            if style.behavior == "karaoke" and highlight_enabled:
                 text = _karaoke_text(caption.words, config)
-                text = fade_in(config.animation_duration_ms) + text
+                animation = fade_in(config.animation_duration_ms) if fade_enabled else ""
+                text = position + animation + text
                 events.append(_event(caption.start, caption.end, text))
             elif style.behavior == "one_word":
                 for word in caption.words:
                     text = _format_word(word.text, config)
-                    text = pop(config.animation_duration_ms) + text
+                    animation = pop(config.animation_duration_ms)
+                    if fade_enabled:
+                        animation += fade_in(config.animation_duration_ms)
+                    text = position + animation + text
                     events.append(_event(word.start, word.end, text))
+            elif not highlight_enabled:
+                text = " ".join(_format_word(word.text, config) for word in caption.words)
+                animation = pop(config.animation_duration_ms) if style.behavior == "pop" else ""
+                if fade_enabled:
+                    animation += fade_in(config.animation_duration_ms)
+                events.append(_event(caption.start, caption.end, position + animation + text))
             else:
                 for active_index, word in enumerate(caption.words):
                     prefix = pop(config.animation_duration_ms) if style.behavior == "pop" else ""
+                    if fade_enabled:
+                        prefix += fade_in(config.animation_duration_ms)
                     text = _highlighted_text(caption.words, active_index, config)
-                    events.append(_event(word.start, word.end, prefix + text))
+                    events.append(_event(word.start, word.end, position + prefix + text))
         return "\n".join((*header, *events, ""))
 
 
@@ -108,3 +138,26 @@ def _ass_color(color: str) -> str:
 
 def _ass_text(value: str) -> str:
     return value.replace(",", " ")
+
+
+def _position_tag(
+    layout: tuple[float, float, float, float], width: int, height: int
+) -> str:
+    from math import isfinite
+
+    if not all(isfinite(value) for value in layout):
+        raise ValueError("El layout del caption debe contener valores finitos.")
+    x, y, scale, spacing = layout
+    if not 0 <= x <= 1 or not 0 <= y <= 1 or not 0.25 <= scale <= 4:
+        raise ValueError("La posición o escala del caption no es válida.")
+    return (
+        r"{\an5\pos("
+        + f"{round(x * max(1, width))},{round(y * max(1, height))}"
+        + r")\fscx"
+        + f"{round(scale * 100)}"
+        + r"\fscy"
+        + f"{round(scale * 100)}"
+        + r"\fsp"
+        + f"{spacing:g}"
+        + "}"
+    )

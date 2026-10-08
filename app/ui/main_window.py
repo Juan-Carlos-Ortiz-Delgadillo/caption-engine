@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QSettings, QThread, QUrl, Qt, Signal, Slot
@@ -37,10 +38,13 @@ from PySide6.QtWidgets import (
 )
 
 from app.core.exceptions import CaptionStudioError
-from app.core.models import CaptionStyleConfig, TranscriptionOptions
+from app.core.models import CaptionStyleConfig, TranscriptionOptions, VideoMetadata
+from app.editor.models import CaptionEditorProject
+from app.editor.service import CaptionEditorService
 from app.services.environment import EnvironmentReport, EnvironmentService
 from app.services.pipeline import CaptionApplicationService, PipelineResult
 from app.styles.registry import StyleRegistry
+from app.ui.caption_editor_window import CaptionEditorWindow
 from app.ui.theme import STYLESHEET
 
 logger = logging.getLogger(__name__)
@@ -88,6 +92,7 @@ class MainWindow(QMainWindow):
         self._video: Path | None = None
         self._thread: QThread | None = None
         self._worker: PipelineWorker | None = None
+        self._preview_window: CaptionEditorWindow | None = None
         self._settings = QSettings("Animated Caption Studio", "Animated Caption Studio")
         self.setWindowTitle("Animated Caption Studio")
         self.setMinimumSize(820, 620)
@@ -110,6 +115,9 @@ class MainWindow(QMainWindow):
         title = QLabel("Animated Caption Studio")
         title.setObjectName("title")
         header.addWidget(title)
+        open_project = QPushButton("Abrir proyecto…")
+        open_project.clicked.connect(self._open_project)
+        header.addWidget(open_project)
         header.addStretch(1)
         self._environment_badge = QLabel("Verificando entorno…")
         self._environment_badge.setObjectName("environmentBadge")
@@ -557,6 +565,7 @@ class MainWindow(QMainWindow):
         dialog = QMessageBox(self)
         dialog.setWindowTitle("Generación completada")
         dialog.setText("Se generaron el video, ASS, SRT, transcript.json y project.acs.")
+        preview_button = dialog.addButton("Abrir editor", QMessageBox.ButtonRole.ActionRole)
         actions = (
             ("Abrir video", result.video),
             ("Abrir carpeta", result.output_directory),
@@ -569,10 +578,65 @@ class MainWindow(QMainWindow):
         ]
         dialog.addButton("Cerrar", QMessageBox.ButtonRole.RejectRole)
         dialog.exec()
+        if dialog.clickedButton() is preview_button:
+            project = CaptionEditorProject.create(
+                result.source_video,
+                result.transcription,
+                result.captions,
+                result.style_id,
+                result.style_config,
+                result.transcription_options,
+                result.metadata,
+            )
+            self._show_editor(CaptionEditorService(project), result.project)
+            return
         for button, path in buttons:
             if dialog.clickedButton() is button:
                 QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
                 break
+
+    @Slot()
+    def _open_project(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Abrir proyecto de captions",
+            str(self._last_folder),
+            "Proyectos Caption Studio (*.acs)",
+        )
+        if not path:
+            return
+        project_path = Path(path)
+        try:
+            editor = CaptionEditorService.load(project_path)
+            project = editor.project
+            metadata = project.video_metadata or self._service.video_metadata(
+                project.source_video
+            )
+            if project.video_metadata is None:
+                editor = CaptionEditorService(
+                    replace(project, video_metadata=metadata)
+                )
+            self._show_editor(editor, project_path, metadata)
+        except (CaptionStudioError, OSError, ValueError) as exc:
+            logger.exception("No se pudo abrir el proyecto %s", project_path.name)
+            QMessageBox.critical(self, "No se pudo abrir el proyecto", str(exc))
+
+    def _show_editor(
+        self,
+        editor: CaptionEditorService,
+        project_path: Path,
+        metadata: VideoMetadata | None = None,
+    ) -> None:
+        metadata = metadata or editor.project.video_metadata
+        if metadata is None:
+            metadata = self._service.video_metadata(editor.project.source_video)
+            editor = CaptionEditorService(
+                replace(editor.project, video_metadata=metadata)
+            )
+        self._preview_window = CaptionEditorWindow(
+            editor, metadata, project_path, self._service, self
+        )
+        self._preview_window.show()
 
     @Slot(str)
     def _on_failure(self, message: str) -> None:

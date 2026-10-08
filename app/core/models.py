@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +18,14 @@ class Word:
     def __post_init__(self) -> None:
         if not self.text.strip():
             raise ValueError("La palabra no puede estar vacía.")
-        if self.start < 0 or self.end < self.start:
+        if (
+            not isfinite(self.start)
+            or not isfinite(self.end)
+            or self.start < 0
+            or self.end < self.start
+            or self.confidence is not None
+            and not isfinite(self.confidence)
+        ):
             raise ValueError("Los tiempos de palabra no son válidos.")
 
 
@@ -99,10 +107,21 @@ class CaptionStyleConfig:
     margin_vertical: int = 70
     uppercase: bool = False
     animation_duration_ms: int = 140
+    fade_enabled: bool | None = None
+    highlight_enabled: bool | None = None
 
     def __post_init__(self) -> None:
         if not 8 <= self.font_size <= 240:
             raise ValueError("El tamaño de fuente debe estar entre 8 y 240.")
+        if (
+            not isfinite(self.outline_width)
+            or not isfinite(self.shadow_depth)
+            or self.outline_width < 0
+            or self.shadow_depth < 0
+            or self.margin_vertical < 0
+            or self.animation_duration_ms < 0
+        ):
+            raise ValueError("La configuración visual contiene valores no válidos.")
         for color in (
             self.primary_color,
             self.highlight_color,
@@ -118,6 +137,12 @@ class CaptionStyleConfig:
                 raise ValueError(f"Color hexadecimal no válido: {color}") from exc
         if self.position not in {"top", "center", "bottom"}:
             raise ValueError("La posición debe ser top, center o bottom.")
+        if self.fade_enabled is not None and not isinstance(self.fade_enabled, bool):
+            raise ValueError("La opción de fade debe ser booleana.")
+        if self.highlight_enabled is not None and not isinstance(
+            self.highlight_enabled, bool
+        ):
+            raise ValueError("La opción de resaltado debe ser booleana.")
 
 
 @dataclass(frozen=True, slots=True)
