@@ -140,7 +140,13 @@ class FFmpegService:
                 assert process.stdout is not None
                 for line in process.stdout:
                     key, separator, value = line.strip().partition("=")
-                    if separator and key == "out_time_us" and progress and duration > 0:
+                    if (
+                        separator
+                        and key == "out_time_us"
+                        and value.isdecimal()
+                        and progress
+                        and duration > 0
+                    ):
                         progress(min(1.0, int(value) / 1_000_000 / duration))
                 code = process.wait()
             except OSError as exc:
