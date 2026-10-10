@@ -109,15 +109,29 @@ class TimelineEditor(QWidget):
             right = (caption.end - self._view_start) * pixels_per_second
             block = QRectF(left, self._BLOCK_TOP, max(10.0, right - left), self._BLOCK_HEIGHT)
             selected = caption.caption_id == self._selected_caption_id
-            painter.setPen(QPen(QColor("#b7aaff" if selected else "#6b5bd4"), 1))
+            border = (
+                "#ff6b6b"
+                if caption.layout_warning
+                else "#b7aaff"
+                if selected
+                else "#6b5bd4"
+            )
+            painter.setPen(QPen(QColor(border), 2 if caption.layout_warning else 1))
             painter.setBrush(QColor("#5946b9" if selected else "#393354"))
             painter.drawRoundedRect(block, 6, 6)
             painter.setPen(QColor("#ffffff"))
             painter.drawText(
-                block.adjusted(8, 0, -8, 0),
+                block.adjusted(8, 0, -20 if caption.layout_warning else -8, 0),
                 Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextSingleLine,
                 caption.text,
             )
+            if caption.layout_warning:
+                painter.setPen(QColor("#ff7777"))
+                painter.drawText(
+                    block.adjusted(0, 0, -5, 0),
+                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                    "!",
+                )
 
         playhead_x = (self._current_time - self._view_start) * pixels_per_second
         if 0 <= playhead_x <= self.width():

@@ -27,6 +27,15 @@ class ExportTests(unittest.TestCase):
         output = ASSGenerator().generate(_captions(), "one_word")
         self.assertEqual(output.count("Dialogue:"), 2)
 
+    def test_caption_style_override_survives_global_style_selection(self) -> None:
+        output = ASSGenerator().generate(
+            _captions(),
+            "minimal",
+            CaptionStyleConfig(),
+            caption_style_ids=("one_word",),
+        )
+        self.assertIn(r"{\fscx85\fscy85\t(0,140,\fscx100\fscy100)}", output)
+
     def test_ass_applies_normalized_caption_layout(self) -> None:
         output = ASSGenerator().generate(
             _captions(),
@@ -46,6 +55,34 @@ class ExportTests(unittest.TestCase):
             caption_layouts=((0.5, 0.5, 1, 0, -15),),
         )
         self.assertIn(r"\frz-15", output)
+
+    def test_ass_width_override_uses_video_space_margins(self) -> None:
+        output = ASSGenerator().generate(
+            _captions(),
+            "minimal",
+            CaptionStyleConfig(highlight_enabled=False),
+            1000,
+            1000,
+            caption_layouts=((0.5, 0.5, 1, 0, 0),),
+            caption_widths=(0.5,),
+        )
+        self.assertIn("Default,,250,250,0,,", output)
+
+    def test_ass_layout_position_tracks_video_resolution(self) -> None:
+        for width, height, expected in (
+            (1920, 1080, r"\pos(480,810)"),
+            (1080, 1920, r"\pos(270,1440)"),
+        ):
+            with self.subTest(width=width, height=height):
+                output = ASSGenerator().generate(
+                    _captions(),
+                    "minimal",
+                    CaptionStyleConfig(highlight_enabled=False),
+                    width,
+                    height,
+                    caption_layouts=((0.25, 0.75, 1, 0, 0),),
+                )
+                self.assertIn(expected, output)
 
     def test_ass_uses_a_dedicated_style_for_fitted_caption_font_size(self) -> None:
         output = ASSGenerator().generate(

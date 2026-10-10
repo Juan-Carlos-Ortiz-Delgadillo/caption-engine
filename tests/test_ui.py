@@ -65,6 +65,18 @@ class MainWindowLayoutTests(unittest.TestCase):
             self.window._set_video(video)
         self.assertTrue(self.window._generate.isEnabled())
 
+    def test_wizard_keeps_style_state_when_returning_to_previous_step(self) -> None:
+        self.assertEqual(self.window._pages.count(), 4)
+        with tempfile.TemporaryDirectory() as directory:
+            video = Path(directory) / "clip.mp4"
+            video.touch()
+            self.window._set_video(video)
+        self.window._show_step(2)
+        self.window._font_size.setValue(88)
+        self.window._previous_step()
+        self.assertEqual(self.window._font_size.value(), 88)
+        self.assertEqual(self.window._current_step, 1)
+
     def test_migrates_previous_default_compute_type_to_cpu_int8(self) -> None:
         self.window.close()
         self.window._settings.setValue("compute_type", "default")

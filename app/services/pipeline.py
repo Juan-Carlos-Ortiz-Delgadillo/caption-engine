@@ -6,25 +6,26 @@ import json
 import logging
 import re
 import tempfile
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from collections.abc import Callable
 
 from app.ass.generator import ASSGenerator
 from app.captions.balance_text import layout_captions
 from app.captions.segmenter import CaptionSegmenter
 from app.core.exceptions import RenderingError
-from app.editor.models import CaptionEditorProject
 from app.core.models import (
     Caption,
     CaptionStyleConfig,
     RenderOptions,
     SegmentationOptions,
-    TranscriptionResult,
     TranscriptionOptions,
+    TranscriptionResult,
     VideoMetadata,
     result_to_dict,
 )
+from app.editor.layout import relayout_project
+from app.editor.models import CaptionEditorProject, transcript_from_dict
 from app.rendering.ffmpeg import FFmpegService
 from app.rendering.renderer import VideoRenderer
 from app.srt.generator import SRTGenerator
@@ -70,6 +71,113 @@ class CaptionApplicationService:
         if not source.is_file():
             raise RenderingError("No se encontró el video fuente del proyecto.")
         return self._ffmpeg.metadata(source)
+
+    def reusable_transcripts(
+        self,
+        source: Path,
+        output_root: Path,
+        recent_projects: tuple[Path, ...] = (),
+    ) -> tuple[Path, ...]:
+        """Find saved transcripts for this exact source path, newest first."""
+        candidates: set[Path] = set()
+        project_paths = set(recent_projects)
+        if output_root.is_dir():
+            project_paths.update(output_root.glob("*/project.acs"))
+        source_path = str(source.resolve())
+        for project_path in project_paths:
+            try:
+                data = json.loads(project_path.read_text(encoding="utf-8"))
+                project_source = Path(data["source_video"]).expanduser()
+                transcript_path = project_path.with_name("transcript.json")
+                if (
+                    str(project_source.resolve()) == source_path
+                    and transcript_path.is_file()
+                ):
+                    candidates.add(transcript_path)
+            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                logger.warning("No se pudo comprobar el proyecto reciente %s", project_path)
+        return tuple(
+            sorted(candidates, key=lambda path: path.stat().st_mtime, reverse=True)
+        )
+
+    def transcribe_to_workspace(
+        self,
+        source: Path,
+        output_directory: Path,
+        transcription_options: TranscriptionOptions,
+        reuse_transcript: Path | None = None,
+        progress: PipelineProgress | None = None,
+    ) -> tuple[TranscriptionResult, VideoMetadata, Path]:
+        if not source.is_file():
+            raise RenderingError(
+                "No se pudo leer el video seleccionado. Vuelve a elegir el archivo."
+            )
+        metadata = self._ffmpeg.metadata(source)
+        output_directory.mkdir(parents=True, exist_ok=True)
+
+        def report(message: str, percent: int) -> None:
+            if progress:
+                progress(message, percent)
+
+        if reuse_transcript is not None:
+            report("Reutilizando transcript.json guardado…", 20)
+            transcript = self.load_transcript(reuse_transcript)
+        else:
+            report("Transcribiendo video en el equipo…", 5)
+
+            def transcription_progress(message: str, percent: float | None) -> None:
+                report(message, 10 if percent is None else 10 + round(85 * percent / 100))
+
+            transcript = self._transcription.transcribe(
+                source, transcription_options, transcription_progress
+            )
+        transcript_path = self.save_transcript(transcript, output_directory)
+        report("Transcripción guardada.", 100)
+        return transcript, metadata, transcript_path
+
+    @staticmethod
+    def create_workspace(output_root: Path, source: Path) -> Path:
+        return _create_project_directory(output_root, _safe_name(source.stem))
+
+    @staticmethod
+    def save_transcript(
+        transcript: TranscriptionResult, output_directory: Path
+    ) -> Path:
+        transcript_path = output_directory / "transcript.json"
+        _write_json_atomic(transcript_path, result_to_dict(transcript))
+        return transcript_path
+
+    @staticmethod
+    def load_transcript(path: Path) -> TranscriptionResult:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return transcript_from_dict(data)
+
+    def build_editor_project(
+        self,
+        source: Path,
+        transcript: TranscriptionResult,
+        transcription_options: TranscriptionOptions,
+        style_id: str,
+        style_config: CaptionStyleConfig,
+        metadata: VideoMetadata,
+        progress: PipelineProgress | None = None,
+    ) -> CaptionEditorProject:
+        if progress:
+            progress("Segmentando captions y aplicando layout…", 15)
+        captions = self._segmenter.segment(transcript, SegmentationOptions())
+        project = CaptionEditorProject.create(
+            source,
+            transcript,
+            captions,
+            style_id,
+            style_config,
+            transcription_options,
+            metadata,
+        )
+        project = relayout_project(project)
+        if progress:
+            progress("Proyecto listo para editar.", 100)
+        return project
 
     def generate(
         self,
@@ -173,6 +281,9 @@ class CaptionApplicationService:
         output_directory: Path,
         render_video: bool = True,
         progress: PipelineProgress | None = None,
+        *,
+        output_name: str = "video_captioned.mp4",
+        crf: int = 20,
     ) -> PipelineResult:
         def report(message: str, percent: int) -> None:
             if progress:
@@ -186,7 +297,7 @@ class CaptionApplicationService:
         srt_path = output_directory / "captions.srt"
         transcript_path = output_directory / "transcript.json"
         project_path = output_directory / "project.acs"
-        video_path = output_directory / "video_captioned.mp4"
+        video_path = output_directory / _safe_output_name(output_name)
         ass_path.write_text(
             self.editor_ass_text(project, metadata), encoding="utf-8"
         )
@@ -201,6 +312,7 @@ class CaptionApplicationService:
                     ass_path,
                     video_path,
                     metadata.duration,
+                    crf=crf,
                 ),
                 lambda ratio: report(
                     "Renderizando video con los cambios…", 40 + round(59 * ratio)
@@ -231,7 +343,7 @@ class CaptionApplicationService:
             (
                 caption.x,
                 caption.y,
-                caption.scale,
+                caption.scale if caption.scale_override else 1.0,
                 caption.word_spacing,
                 caption.rotation_deg,
             )
@@ -244,6 +356,19 @@ class CaptionApplicationService:
             metadata.width,
             metadata.height,
             caption_layouts=layouts,
+            caption_font_sizes=tuple(
+                min(
+                    caption.layout_font_size or project.style_config.font_size,
+                    project.style_config.font_size,
+                )
+                for caption in project.captions
+            ),
+            caption_style_ids=tuple(
+                caption.style_id for caption in project.captions
+            ),
+            caption_widths=tuple(
+                caption.max_width for caption in project.captions
+            ),
         )
 
     def render_editor_preview_frame(
@@ -263,6 +388,16 @@ def _safe_name(name: str) -> str:
     return cleaned[:80] or "proyecto"
 
 
+def _safe_output_name(name: str) -> str:
+    candidate = Path(name).name
+    if not candidate.lower().endswith(".mp4"):
+        candidate += ".mp4"
+    cleaned = re.sub(r"[^\w.-]+", "_", candidate, flags=re.UNICODE).strip("._")
+    if not cleaned or cleaned.lower() == ".mp4":
+        raise ValueError("El nombre del archivo de salida no es válido.")
+    return cleaned[:120]
+
+
 def _create_project_directory(output_root: Path, project_name: str) -> Path:
     output_root.mkdir(parents=True, exist_ok=True)
     for index in range(1, 10_000):
@@ -274,3 +409,27 @@ def _create_project_directory(output_root: Path, project_name: str) -> Path:
             continue
         return candidate
     raise FileExistsError("No hay nombres de carpeta de salida disponibles para este proyecto.")
+
+
+def _write_json_atomic(path: Path, data: dict) -> None:
+    import os
+
+    temporary_path: Path | None = None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            json.dump(data, temporary_file, ensure_ascii=False, indent=2)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()

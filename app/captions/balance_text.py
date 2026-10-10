@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import logging
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from functools import lru_cache
-import logging
+from functools import cache, lru_cache
 from math import isfinite
-import unicodedata
 
 from PySide6.QtGui import QFont, QFontDatabase, QFontInfo, QFontMetricsF
 
@@ -181,6 +181,73 @@ def layout_captions(
     return tuple(laid_out), tuple(font_sizes)
 
 
+def fit_manual_caption(
+    caption: Caption,
+    config: CaptionStyleConfig,
+    video_width: int,
+    video_height: int,
+    *,
+    bold_style: bool = False,
+) -> tuple[int | None, str | None]:
+    """Fit a caption while keeping its user-authored line boundaries."""
+    side_margin = 80 * video_width / 1080
+    max_width = video_width - 2 * side_margin
+    max_height = video_height - 2 * config.margin_vertical
+    if max_width <= 0 or max_height <= 0:
+        return None, "La resolución no deja espacio para los márgenes configurados."
+
+    lines: list[str] = []
+    start = 0
+    for break_after in (*caption.line_breaks, len(caption.words) - 1):
+        lines.append(
+            " ".join(
+                _display_word(word.text, config)
+                for word in caption.words[start : break_after + 1]
+            )
+        )
+        start = break_after + 1
+    if len(lines) > 6:
+        return None, "Las líneas manuales exceden el máximo de seis líneas."
+
+    effect_margin = config.shadow_depth + 3 * max(
+        config.blur, config.glow_radius if config.glow_enabled else 0.0
+    )
+    stroke_width = (
+        max(config.outline_width, config.bubble_padding)
+        if config.bubble_enabled
+        else config.outline_width
+    )
+    font_weight = 700 if config.bold or bold_style else 400
+    minimum_font_size = min(config.font_size, 56)
+    for font_size in range(config.font_size, minimum_font_size - 1, -1):
+        font = QFont(config.font_family)
+        font.setPixelSize(font_size)
+        font.setWeight(QFont.Weight(font_weight))
+        font.setItalic(config.italic)
+        font_info = QFontInfo(font)
+        if font_info.family().casefold() != config.font_family.casefold():
+            return None, (
+                f"La fuente «{config.font_family}» no está instalada o Qt usa "
+                "una fuente alternativa."
+            )
+        metrics = QFontMetricsF(font)
+        effect_width = 2 * (stroke_width + effect_margin)
+        width = max(
+            (metrics.horizontalAdvance(line) + effect_width for line in lines),
+            default=0.0,
+        )
+        line_height = max(
+            (config.font_size * 1.2 + config.line_spacing)
+            * font_size
+            / config.font_size,
+            metrics.lineSpacing(),
+        )
+        height = len(lines) * line_height + effect_width
+        if width <= max_width and height <= max_height:
+            return font_size, None
+    return None, "Las líneas manuales no caben en el área segura del video."
+
+
 def balance_text(
     text: str,
     font_family: str,
@@ -306,7 +373,7 @@ def _best_split(
     total_width = measure(" ".join(words)) - 2 * (stroke_width + effect_margin)
     target_width = total_width / line_count
 
-    @lru_cache(maxsize=None)
+    @cache
     def best(
         start: int, remaining: int
     ) -> tuple[float, tuple[str, ...], tuple[float, ...]] | None:

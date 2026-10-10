@@ -11,9 +11,9 @@ from uuid import uuid4
 from app.core.models import (
     Caption,
     CaptionStyleConfig,
-    TranscriptSegment,
     TranscriptionOptions,
     TranscriptionResult,
+    TranscriptSegment,
     VideoMetadata,
     Word,
     result_to_dict,
@@ -32,7 +32,14 @@ class EditableCaption:
     word_spacing: float = 0.0
     style_id: str | None = None
     rotation_deg: float = 0.0
+    position_override: bool = False
+    scale_override: bool = False
+    max_width: float = 0.9
+    max_width_override: bool = False
     line_breaks: tuple[int, ...] = ()
+    line_breaks_manual: bool = False
+    layout_font_size: int | None = None
+    layout_warning: str | None = None
 
     def __post_init__(self) -> None:
         if not self.caption_id or not self.words:
@@ -47,10 +54,14 @@ class EditableCaption:
             raise ValueError("El espaciado entre palabras debe estar entre -20 y 100.")
         if not isfinite(self.rotation_deg) or not -180 <= self.rotation_deg <= 180:
             raise ValueError("La rotación debe estar entre -180 y 180 grados.")
+        if not isfinite(self.max_width) or not 0.1 <= self.max_width <= 1:
+            raise ValueError("El ancho máximo debe estar entre 0.1 y 1.")
         if tuple(sorted(set(self.line_breaks))) != self.line_breaks or any(
             index < 0 or index >= len(self.words) - 1 for index in self.line_breaks
         ):
             raise ValueError("Los saltos de línea deben separar palabras del caption.")
+        if self.layout_font_size is not None and not 8 <= self.layout_font_size <= 240:
+            raise ValueError("El tamaño de fuente ajustado no es válido.")
         if any(
             not isfinite(word.start)
             or not isfinite(word.end)
@@ -130,7 +141,7 @@ class CaptionEditorProject:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "version": 2,
+            "version": 4,
             "source_video": str(self.source_video),
             "transcript": result_to_dict(self.original_transcript),
             "captions": [
@@ -143,7 +154,14 @@ class CaptionEditorProject:
                     "scale": caption.scale,
                     "word_spacing": caption.word_spacing,
                     "rotation_deg": caption.rotation_deg,
+                    "position_override": caption.position_override,
+                    "scale_override": caption.scale_override,
+                    "max_width": caption.max_width,
+                    "max_width_override": caption.max_width_override,
                     "line_breaks": caption.line_breaks,
+                    "line_breaks_manual": caption.line_breaks_manual,
+                    "layout_font_size": caption.layout_font_size,
+                    "layout_warning": caption.layout_warning,
                     "style_id": caption.style_id,
                 }
                 for caption in self.captions
@@ -174,9 +192,11 @@ def transcript_from_dict(data: dict[str, Any]) -> TranscriptionResult:
 
 
 def project_from_dict(data: dict[str, Any]) -> CaptionEditorProject:
-    if data.get("version") != 2:
+    if data.get("version") not in {2, 3, 4}:
         raise ValueError("La versión del proyecto editable no es compatible.")
     transcript = transcript_from_dict(data["transcript"])
+    style_config = CaptionStyleConfig(**data["style_config"])
+    default_y = {"top": 0.12, "center": 0.5, "bottom": 0.82}[style_config.position]
     captions = tuple(
         EditableCaption(
             caption_id=caption["id"],
@@ -188,7 +208,17 @@ def project_from_dict(data: dict[str, Any]) -> CaptionEditorProject:
             scale=caption.get("scale", 1.0),
             word_spacing=caption.get("word_spacing", 0.0),
             rotation_deg=caption.get("rotation_deg", 0.0),
+            position_override=caption.get(
+                "position_override",
+                caption["position"]["x"] != 0.5 or caption["position"]["y"] != default_y,
+            ),
+            scale_override=caption.get("scale_override", caption.get("scale", 1.0) != 1.0),
+            max_width=caption.get("max_width", 0.9),
+            max_width_override=caption.get("max_width_override", False),
             line_breaks=tuple(caption.get("line_breaks", ())),
+            line_breaks_manual=bool(caption.get("line_breaks_manual", False)),
+            layout_font_size=caption.get("layout_font_size"),
+            layout_warning=caption.get("layout_warning"),
             style_id=caption.get("style_id"),
         )
         for caption in data["captions"]
@@ -198,7 +228,7 @@ def project_from_dict(data: dict[str, Any]) -> CaptionEditorProject:
         original_transcript=transcript,
         captions=captions,
         style_id=data["style_id"],
-        style_config=CaptionStyleConfig(**data["style_config"]),
+        style_config=style_config,
         edited=bool(data.get("edited", False)),
         transcription_options=TranscriptionOptions(**data.get("transcription", {})),
         video_metadata=(

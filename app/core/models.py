@@ -193,6 +193,7 @@ class RenderOptions:
     duration: float
     preset: str = "medium"
     crf: int = 20
+    quality: str = "balanced"
 
 
 @dataclass(frozen=True, slots=True)

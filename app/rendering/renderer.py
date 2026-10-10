@@ -14,6 +14,12 @@ class VideoRenderer:
         self, options: RenderOptions, progress: ProgressCallback | None = None
     ) -> Path:
         self._ffmpeg.render(
-            options.source, options.subtitles, options.output, options.duration, progress
+            options.source,
+            options.subtitles,
+            options.output,
+            options.duration,
+            progress,
+            preset=options.preset,
+            crf=options.crf,
         )
         return options.output

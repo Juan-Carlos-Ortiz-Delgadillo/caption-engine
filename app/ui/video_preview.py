@@ -5,14 +5,16 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from math import atan2, degrees, hypot
+from uuid import uuid4
 
 from PySide6.QtCore import (
+    QEvent,
     QObject,
     QPointF,
     QRectF,
+    Qt,
     QThread,
     QTimer,
-    Qt,
     QUrl,
     Signal,
     Slot,
@@ -22,6 +24,7 @@ from PySide6.QtGui import (
     QFont,
     QFontMetricsF,
     QImage,
+    QKeyEvent,
     QMouseEvent,
     QPainter,
     QPen,
@@ -32,9 +35,11 @@ from PySide6.QtGui import (
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
-    QHBoxLayout,
     QComboBox,
+    QHBoxLayout,
     QLabel,
+    QLineEdit,
+    QMenu,
     QPushButton,
     QSlider,
     QStackedLayout,
@@ -43,9 +48,19 @@ from PySide6.QtWidgets import (
 )
 
 from app.core.models import Caption, VideoMetadata
-from app.editor.service import CaptionEditorService
 from app.editor.models import EditableCaption
+from app.editor.service import CaptionEditorService
 from app.styles.registry import StyleRegistry
+from app.ui.preview_geometry import (
+    Rect as GeometryRect,
+)
+from app.ui.preview_geometry import (
+    caption_handle_at,
+    moved_position,
+    resized_width,
+    scaled_value,
+    video_rect,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +69,7 @@ class CaptionOverlay(QWidget):
     captionSelected = Signal(str)
     captionMoved = Signal(str)
     captionDeleted = Signal(str)
+    captionEdited = Signal()
 
     def __init__(
         self,
@@ -73,18 +89,63 @@ class CaptionOverlay(QWidget):
         self._drag_origin = QPointF()
         self._drag_rotation = 0.0
         self._drag_scale = 1.0
+        self._drag_width = 0.9
+        self._drag_x = 0.0
+        self._drag_y = 0.0
+        self._drag_token: str | None = None
+        self._drag_video_rect = QRectF()
+        self._pan = QPointF()
+        self._rendered_frame: QWidget | None = None
+        self._inline_edit: QLineEdit | None = None
+        self._pan_origin = QPointF()
+        self._pan_start = QPointF()
         self._draw_text = True
         self._preview_zoom = 1.0
         self._preview_ratio: float | None = None
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setMouseTracking(True)
+        self.installEventFilter(self)
 
     def set_time(self, seconds: float) -> None:
         self._time = max(0.0, seconds)
         self.update()
 
+    def set_pan(self, x: float, y: float) -> None:
+        self._pan = QPointF(x, y)
+        self.update()
+
+    def set_rendered_frame(self, rendered_frame: QWidget) -> None:
+        self._rendered_frame = rendered_frame
+
     def set_selected_caption(self, caption_id: str | None) -> None:
         self._selected_caption_id = caption_id
         self.update()
+
+    @property
+    def selected_caption_id(self) -> str | None:
+        return self._selected_caption_id
+
+    def move_selected_by(self, dx: int, dy: int) -> bool:
+        if not self._selected_caption_id:
+            return False
+        caption = next(
+            (
+                item
+                for item in self._editor.project.captions
+                if item.caption_id == self._selected_caption_id
+            ),
+            None,
+        )
+        if caption is None:
+            return False
+        self._editor.move_caption(
+            caption.caption_id,
+            min(1, max(0, caption.x + dx / self._metadata.width)),
+            min(1, max(0, caption.y + dy / self._metadata.height)),
+        )
+        self.captionMoved.emit(caption.caption_id)
+        return True
 
     def set_selected_word(self, word_index: int) -> None:
         self._selected_word_index = max(0, word_index)
@@ -100,43 +161,86 @@ class CaptionOverlay(QWidget):
         self.update()
 
     def paintEvent(self, _event) -> None:
-        caption = _active_caption(self._editor.project.captions, self._time)
-        if caption is None or self._metadata.width <= 0 or self._metadata.height <= 0:
+        captions = _active_captions(self._editor.project.captions, self._time)
+        if not captions or self._metadata.width <= 0 or self._metadata.height <= 0:
             return
 
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.save()
+        if self._preview_ratio is not None:
+            painter.setClipRect(
+                _preview_viewport_rect(
+                    self.width(), self.height(), self._preview_ratio
+                )
+            )
         video_rect = _preview_video_rect(
             self.width(),
             self.height(),
             self._metadata,
             self._preview_ratio,
             self._preview_zoom,
+            self._pan.x(),
+            self._pan.y(),
         )
-        if not self._draw_text:
-            if caption.caption_id == self._selected_caption_id:
-                bounds = _caption_bounds(caption, video_rect, self._caption_font(caption))
-                self._draw_selection_handles(painter, bounds)
-            return
+        safe = video_rect.adjusted(
+            video_rect.width() * 0.05,
+            video_rect.height() * 0.05,
+            -video_rect.width() * 0.05,
+            -video_rect.height() * 0.05,
+        )
+        painter.setPen(QPen(QColor(255, 255, 255, 70), 1, Qt.PenStyle.DotLine))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(safe)
+        if self._drag_caption_id and self._drag_mode == "move":
+            selected_caption = next(
+                (item for item in captions if item.caption_id == self._drag_caption_id),
+                None,
+            )
+            if selected_caption and (
+                abs(selected_caption.x - 0.5) < 0.0001
+                or abs(selected_caption.y - 0.5) < 0.0001
+            ):
+                painter.setPen(QPen(QColor("#52D7FF"), 1, Qt.PenStyle.DashLine))
+                if abs(selected_caption.x - 0.5) < 0.0001:
+                    x = video_rect.x() + video_rect.width() / 2
+                    painter.drawLine(QPointF(x, video_rect.top()), QPointF(x, video_rect.bottom()))
+                if abs(selected_caption.y - 0.5) < 0.0001:
+                    y = video_rect.y() + video_rect.height() / 2
+                    painter.drawLine(QPointF(video_rect.left(), y), QPointF(video_rect.right(), y))
+        if self._draw_text:
+            for caption in captions:
+                self._draw_caption(painter, caption, video_rect)
+        selected = next(
+            (caption for caption in captions if caption.caption_id == self._selected_caption_id),
+            None,
+        )
+        if selected is not None:
+            self._draw_selection_handles(
+                painter, _caption_bounds(selected, video_rect, self._caption_font(selected))
+            )
+        painter.restore()
+
+    def _draw_caption(self, painter: QPainter, caption: EditableCaption, video_rect: QRectF) -> None:
         style = self._editor.project.style_config
         scale = video_rect.width() / self._metadata.width * caption.scale
-        font = QFont(style.font_family)
-        font.setPixelSize(max(8, round(style.font_size * scale)))
-        font.setLetterSpacing(
-            QFont.SpacingType.AbsoluteSpacing, caption.word_spacing * scale
-        )
+        font = self._caption_font(caption)
         painter.setFont(font)
-
         text = caption.text.upper() if style.uppercase else caption.text
         text_rect = _caption_bounds(caption, video_rect, font)
         flags = Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap
-
         if style.shadow_depth > 0:
-            shadow = text_rect.translated(
-                style.shadow_depth * scale, style.shadow_depth * scale
-            )
             painter.setPen(QColor(style.shadow_color))
-            painter.drawText(shadow, flags, text)
+            painter.drawText(
+                text_rect.translated(style.shadow_depth * scale, style.shadow_depth * scale),
+                flags,
+                text,
+            )
+        if style.bubble_enabled:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(style.background_color))
+            painter.drawRect(text_rect.adjusted(-style.bubble_padding * scale, -style.bubble_padding * scale,
+                                                style.bubble_padding * scale, style.bubble_padding * scale))
         painter.setPen(
             QPen(
                 QColor(style.outline_color),
@@ -154,11 +258,9 @@ class CaptionOverlay(QWidget):
             style,
             self._time,
             self._selected_word_index,
-            self._editor.project.style_id,
+            caption.style_id or self._editor.project.style_id,
             font,
         )
-        if caption.caption_id == self._selected_caption_id:
-            self._draw_selection_handles(painter, text_rect)
 
     def _draw_selection_handles(self, painter: QPainter, bounds: QRectF) -> None:
         expanded = bounds.adjusted(-5, -5, 5, 5)
@@ -169,9 +271,10 @@ class CaptionOverlay(QWidget):
         for point in (
             expanded.topRight(),
             expanded.bottomLeft(),
-            expanded.bottomRight(),
         ):
             painter.drawEllipse(point, 6, 6)
+        painter.drawEllipse(QPointF(expanded.center().x(), expanded.top()), 6, 6)
+        painter.drawEllipse(QPointF(expanded.center().x(), expanded.bottom()), 6, 6)
         delete_center = expanded.topLeft()
         painter.setBrush(QColor("#F05262"))
         painter.drawEllipse(delete_center, 10, 10)
@@ -190,13 +293,30 @@ class CaptionOverlay(QWidget):
         )
         painter.drawEllipse(rotate_center + QPointF(0, 18), 6, 6)
 
+    def _caption_candidates(self) -> list[EditableCaption]:
+        return [
+            caption
+            for caption in self._editor.project.captions
+            if caption.start <= self._time < caption.end
+        ]
+
     def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._pan_origin = event.position()
+            self._pan_start = self._pan
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
         if event.button() != Qt.MouseButton.LeftButton:
             return
-        caption = _active_caption(self._editor.project.captions, self._time)
-        if caption is None:
+        candidates = self._caption_candidates()
+        if not candidates:
             return
         if self._metadata.width <= 0 or self._metadata.height <= 0:
+            return
+        if not _preview_viewport_rect(
+            self.width(), self.height(), self._preview_ratio
+        ).contains(event.position()):
             return
         video_rect = _preview_video_rect(
             self.width(),
@@ -204,12 +324,21 @@ class CaptionOverlay(QWidget):
             self._metadata,
             self._preview_ratio,
             self._preview_zoom,
+            self._pan.x(),
+            self._pan.y(),
         )
-        bounds = _caption_bounds(caption, video_rect, self._caption_font(caption)).adjusted(
-            -5, -5, 5, 5
-        )
-        if not bounds.adjusted(-15, -15, 15, 15).contains(event.position()):
+        candidates = [
+            caption for caption in candidates
+            if _caption_bounds(caption, video_rect, self._caption_font(caption))
+            .adjusted(-18, -18, 18, 18).contains(event.position())
+        ]
+        if not candidates:
             return
+        caption = next(
+            (item for item in reversed(candidates) if item.caption_id == self._selected_caption_id),
+            candidates[-1],
+        )
+        bounds = _caption_bounds(caption, video_rect, self._caption_font(caption)).adjusted(-5, -5, 5, 5)
         delete_bounds = QRectF(
             bounds.topLeft() - QPointF(10, 10),
             bounds.topLeft() + QPointF(10, 10),
@@ -227,17 +356,26 @@ class CaptionOverlay(QWidget):
         self._drag_origin = event.position()
         self._drag_rotation = caption.rotation_deg
         self._drag_scale = caption.scale
-        if (event.position() - (bounds.bottomRight() + QPointF(0, 18))).manhattanLength() <= 12:
+        self._drag_width = caption.max_width
+        self._drag_x = caption.x
+        self._drag_y = caption.y
+        self._drag_video_rect = video_rect
+        self._drag_token = str(uuid4())
+        handle = caption_handle_at(
+            event.position().x(), event.position().y(),
+            GeometryRect(bounds.x(), bounds.y(), bounds.width(), bounds.height()),
+        )
+        if handle == "rotate":
             self._drag_mode = "rotate"
-        elif (
-            (event.position() - bounds.topRight()).manhattanLength() <= 10
-            or (event.position() - bounds.bottomLeft()).manhattanLength() <= 10
-        ):
+        elif handle == "width":
+            self._drag_mode = "width"
+        elif handle == "resize":
             self._drag_mode = "resize"
         else:
             self._drag_mode = "move"
         self.captionSelected.emit(caption.caption_id)
         self.update()
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
         event.accept()
 
     def _caption_font(self, caption: EditableCaption) -> QFont:
@@ -248,6 +386,8 @@ class CaptionOverlay(QWidget):
             self._metadata,
             self._preview_ratio,
             self._preview_zoom,
+            self._pan.x(),
+            self._pan.y(),
         ).width()
         scale = scale / self._metadata.width * caption.scale
         font = QFont(style.font_family)
@@ -258,15 +398,19 @@ class CaptionOverlay(QWidget):
         return font
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if event.buttons() & Qt.MouseButton.MiddleButton:
+            self._pan = self._pan_start + event.position() - self._pan_origin
+            if isinstance(self._rendered_frame, RenderedFrameLabel):
+                self._rendered_frame.set_pan(self._pan.x(), self._pan.y())
+            self.update()
+            event.accept()
+            return
+        if not self._drag_caption_id:
+            self._update_cursor(event.position())
+            return
         if not self._drag_caption_id or not event.buttons() & Qt.MouseButton.LeftButton:
             return
-        video_rect = _preview_video_rect(
-            self.width(),
-            self.height(),
-            self._metadata,
-            self._preview_ratio,
-            self._preview_zoom,
-        )
+        video_rect = self._drag_video_rect
         if video_rect.isEmpty():
             return
         if self._drag_mode == "rotate":
@@ -277,27 +421,195 @@ class CaptionOverlay(QWidget):
                 -180.0,
                 min(180.0, self._drag_rotation + delta),
             )
-            self._editor.rotate_caption(self._drag_caption_id, rotation)
+            self._editor.rotate_caption(
+                self._drag_caption_id, rotation, merge_token=self._drag_token
+            )
         elif self._drag_mode == "resize":
             initial = max(1.0, _distance(self._drag_center, self._drag_origin))
             current = _distance(self._drag_center, event.position())
             self._editor.resize_caption(
                 self._drag_caption_id,
-                max(0.25, min(4.0, self._drag_scale * current / initial)),
+                scaled_value(self._drag_scale, initial, current),
+                merge_token=self._drag_token,
+            )
+        elif self._drag_mode == "width":
+            self._editor.set_caption_width(
+                self._drag_caption_id,
+                resized_width(
+                    self._drag_width,
+                    (event.position().x() - self._drag_origin.x())
+                    * self._metadata.width
+                    / video_rect.width(),
+                    self._metadata.width,
+                ),
+                merge_token=self._drag_token,
             )
         else:
-            x = min(1.0, max(0.0, (event.position().x() - video_rect.x()) / video_rect.width()))
-            y = min(1.0, max(0.0, (event.position().y() - video_rect.y()) / video_rect.height()))
-            self._editor.move_caption(self._drag_caption_id, x, y)
+            delta = event.position() - self._drag_origin
+            x, y = moved_position(
+                self._drag_x,
+                self._drag_y,
+                delta.x() * self._metadata.width / video_rect.width(),
+                delta.y() * self._metadata.height / video_rect.height(),
+                self._metadata.width,
+                self._metadata.height,
+                lock_axis=bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier),
+            )
+            self._editor.move_caption(
+                self._drag_caption_id, x, y, merge_token=self._drag_token
+            )
         self.captionMoved.emit(self._drag_caption_id)
         self.update()
         event.accept()
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self.unsetCursor()
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_caption_id = None
             self._drag_mode = "move"
+            self._drag_token = None
+            self.captionMoved.emit(self._selected_caption_id or "")
             event.accept()
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        self.mousePressEvent(event)
+        if not self._selected_caption_id:
+            return
+        caption = next(
+            (item for item in self._caption_candidates()
+             if item.caption_id == self._selected_caption_id),
+            None,
+        )
+        if caption is None:
+            return
+        if self._inline_edit is None:
+            self._inline_edit = QLineEdit(self)
+            self._inline_edit.returnPressed.connect(self._commit_inline_edit)
+            self._inline_edit.installEventFilter(self)
+        bounds = _caption_bounds(caption, self._drag_video_rect, self._caption_font(caption))
+        self._inline_edit.setGeometry(bounds.toAlignedRect())
+        self._inline_edit.setText(caption.text)
+        self._inline_edit.show()
+        self._inline_edit.setFocus()
+        self._inline_edit.selectAll()
+        event.accept()
+
+    def _commit_inline_edit(self) -> None:
+        if self._inline_edit and self._selected_caption_id:
+            self._editor.update_text(self._selected_caption_id, self._inline_edit.text())
+            self._inline_edit.hide()
+            self.captionEdited.emit()
+
+    def eventFilter(self, watched, event) -> bool:
+        if (
+            watched is self._inline_edit
+            and event.type() == QEvent.Type.KeyPress
+            and event.key() == Qt.Key.Key_Escape
+        ):
+            self._inline_edit.hide()
+            return True
+        if watched is self and event.type() == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Tab:
+                candidates = self._caption_candidates()
+                if candidates:
+                    ids = [caption.caption_id for caption in candidates]
+                    current = ids.index(self._selected_caption_id) if self._selected_caption_id in ids else -1
+                    self._selected_caption_id = ids[(current + 1) % len(ids)]
+                    self.captionSelected.emit(self._selected_caption_id)
+                    self.update()
+                return True
+            if self._selected_caption_id and event.key() in {
+                Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down
+            }:
+                step = 10 if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else 1
+                dx = (-step if event.key() == Qt.Key.Key_Left else step if event.key() == Qt.Key.Key_Right else 0)
+                dy = (-step if event.key() == Qt.Key.Key_Up else step if event.key() == Qt.Key.Key_Down else 0)
+                caption = next(c for c in self._editor.project.captions if c.caption_id == self._selected_caption_id)
+                self._editor.move_caption(
+                    caption.caption_id,
+                    min(1, max(0, caption.x + dx / self._metadata.width)),
+                    min(1, max(0, caption.y + dy / self._metadata.height)),
+                )
+                self.captionMoved.emit(caption.caption_id)
+                return True
+        return super().eventFilter(watched, event)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() == Qt.Key.Key_Tab:
+            candidates = self._caption_candidates()
+            if candidates:
+                ids = [caption.caption_id for caption in candidates]
+                current = ids.index(self._selected_caption_id) if self._selected_caption_id in ids else -1
+                self._selected_caption_id = ids[(current + 1) % len(ids)]
+                self.captionSelected.emit(self._selected_caption_id)
+                self.update()
+            event.accept()
+            return
+        if self._selected_caption_id and event.key() in {
+            Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down
+        }:
+            step = 10 if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else 1
+            dx = (-step if event.key() == Qt.Key.Key_Left else step if event.key() == Qt.Key.Key_Right else 0)
+            dy = (-step if event.key() == Qt.Key.Key_Up else step if event.key() == Qt.Key.Key_Down else 0)
+            caption = next(c for c in self._editor.project.captions if c.caption_id == self._selected_caption_id)
+            self._editor.move_caption(
+                caption.caption_id,
+                min(1, max(0, caption.x + dx / self._metadata.width)),
+                min(1, max(0, caption.y + dy / self._metadata.height)),
+            )
+            self.captionMoved.emit(caption.caption_id)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _update_cursor(self, position: QPointF) -> None:
+        video_rect = _preview_video_rect(
+            self.width(), self.height(), self._metadata, self._preview_ratio,
+            self._preview_zoom, self._pan.x(), self._pan.y()
+        )
+        for caption in reversed(self._caption_candidates()):
+            bounds = _caption_bounds(caption, video_rect, self._caption_font(caption)).adjusted(-5, -5, 5, 5)
+            handle = caption_handle_at(position.x(), position.y(), GeometryRect(bounds.x(), bounds.y(), bounds.width(), bounds.height()))
+            if handle:
+                self.setCursor(Qt.CursorShape.SizeFDiagCursor if handle == "resize" else Qt.CursorShape.CrossCursor)
+                return
+            if bounds.contains(position):
+                self.setCursor(Qt.CursorShape.SizeAllCursor)
+                return
+        self.unsetCursor()
+
+    def contextMenuEvent(self, event) -> None:
+        self._show_context_menu(event.globalPos())
+
+    def _show_context_menu(self, global_pos) -> None:
+        if not self._selected_caption_id:
+            return
+        menu = QMenu(self)
+        center = menu.addAction("Centrar")
+        reset = menu.addAction("Restablecer posición y escala")
+        duplicate = menu.addAction("Duplicar")
+        split = menu.addAction("Dividir aquí")
+        delete = menu.addAction("Eliminar")
+        chosen = menu.exec(global_pos)
+        if chosen == center:
+            self._editor.move_caption(self._selected_caption_id, 0.5, 0.5)
+        elif chosen == reset:
+            self._editor.reset_caption_geometry(self._selected_caption_id)
+        elif chosen == duplicate:
+            self._selected_caption_id = self._editor.duplicate_caption(self._selected_caption_id)
+            self.captionSelected.emit(self._selected_caption_id)
+        elif chosen == split:
+            caption = next(c for c in self._editor.project.captions if c.caption_id == self._selected_caption_id)
+            split_index = next((i for i, word in enumerate(caption.words) if word.start >= self._time), 0)
+            if 0 < split_index < len(caption.words):
+                self._editor.split_caption(caption.caption_id, split_index)
+        elif chosen == delete:
+            self.captionDeleted.emit(self._selected_caption_id)
+        self.captionEdited.emit()
+        self.update()
 
 
 class PreviewFrameWorker(QObject):
@@ -327,6 +639,7 @@ class RenderedFrameLabel(QLabel):
         self._image = QImage()
         self._zoom = 1.0
         self._ratio: float | None = None
+        self._pan = QPointF()
         self.setStyleSheet("background: #111318;")
 
     def set_frame(self, image: QImage) -> None:
@@ -377,8 +690,8 @@ class RenderedFrameLabel(QLabel):
         width = self._image.width() * scale * self._zoom
         height = self._image.height() * scale * self._zoom
         destination = QRectF(
-            target.center().x() - width / 2,
-            target.center().y() - height / 2,
+            target.center().x() - width / 2 + self._pan.x(),
+            target.center().y() - height / 2 + self._pan.y(),
             width,
             height,
         )
@@ -393,6 +706,7 @@ class VideoPreview(QWidget):
     captionSelected = Signal(str)
     captionMoved = Signal(str)
     captionDeleted = Signal(str)
+    captionEdited = Signal()
     frameError = Signal(str)
     timeChanged = Signal(float)
 
@@ -423,10 +737,12 @@ class VideoPreview(QWidget):
         self._rendered_frame = RenderedFrameLabel(video_container)
         self._rendered_frame.setVisible(frame_renderer is not None)
         self._overlay = CaptionOverlay(editor, metadata, video_container)
+        self._overlay.set_rendered_frame(self._rendered_frame)
         self._overlay.set_draw_text(frame_renderer is None)
         self._overlay.captionSelected.connect(self.captionSelected)
         self._overlay.captionMoved.connect(self.captionMoved)
         self._overlay.captionDeleted.connect(self.captionDeleted)
+        self._overlay.captionEdited.connect(self.captionEdited)
         video_stack.addWidget(self._video)
         video_stack.addWidget(self._rendered_frame)
         video_stack.addWidget(self._overlay)
@@ -491,6 +807,13 @@ class VideoPreview(QWidget):
     def is_rendering_frame(self) -> bool:
         return self._frame_thread is not None and self._frame_thread.isRunning()
 
+    @property
+    def selected_caption_id(self) -> str | None:
+        return self._overlay.selected_caption_id
+
+    def move_selected_caption(self, dx: int, dy: int) -> bool:
+        return self._overlay.move_selected_by(dx, dy)
+
     def seek(self, seconds: float) -> None:
         self._player.setPosition(max(0, round(seconds * 1000)))
 
@@ -508,8 +831,10 @@ class VideoPreview(QWidget):
 
     def _fit_preview(self) -> None:
         self._rendered_frame.set_zoom(1.0)
+        self._rendered_frame.set_pan(0, 0)
         self._ratio.setCurrentIndex(0)
         self._overlay.set_view(1.0, None)
+        self._overlay.set_pan(0, 0)
 
     def _zoom_preview(self, factor: float) -> None:
         self._rendered_frame.zoom_by(factor)
@@ -596,6 +921,7 @@ class VideoPreview(QWidget):
         self._rendered_frame.setVisible(True)
         self._overlay.set_draw_text(False)
         self._rendered_frame.set_frame(image)
+        self._rendered_frame.update()
         self._rendered_frame.setToolTip("")
 
     @Slot(str)
@@ -627,6 +953,17 @@ def _active_caption(
     )
 
 
+def _active_captions(
+    captions: tuple[Caption | EditableCaption, ...], seconds: float
+) -> tuple[EditableCaption, ...]:
+    return tuple(
+        caption
+        for caption in captions
+        if isinstance(caption, EditableCaption)
+        and caption.start <= seconds < caption.end
+    )
+
+
 def _fit_video_rect(width: int, height: int, metadata: VideoMetadata) -> QRectF:
     if width <= 0 or height <= 0 or metadata.width <= 0 or metadata.height <= 0:
         return QRectF()
@@ -646,38 +983,42 @@ def _preview_video_rect(
     metadata: VideoMetadata,
     ratio: float | None,
     zoom: float,
+    pan_x: float = 0.0,
+    pan_y: float = 0.0,
 ) -> QRectF:
-    if width <= 0 or height <= 0 or metadata.width <= 0 or metadata.height <= 0:
-        return QRectF()
-    canvas = QRectF(0, 0, width, height)
-    if ratio:
-        canvas_ratio = width / height
-        if canvas_ratio > ratio:
-            canvas_width = height * ratio
-            canvas.setX((width - canvas_width) / 2)
-            canvas.setWidth(canvas_width)
-        else:
-            canvas_height = width / ratio
-            canvas.setY((height - canvas_height) / 2)
-            canvas.setHeight(canvas_height)
-    scale_x = canvas.width() / metadata.width
-    scale_y = canvas.height() / metadata.height
-    scale = max(scale_x, scale_y) if ratio else min(scale_x, scale_y)
-    video_width = metadata.width * scale * zoom
-    video_height = metadata.height * scale * zoom
-    return QRectF(
-        canvas.center().x() - video_width / 2,
-        canvas.center().y() - video_height / 2,
-        video_width,
-        video_height,
+    rect = video_rect(
+        width,
+        height,
+        metadata.width,
+        metadata.height,
+        zoom=zoom,
+        target_ratio=ratio,
+        pan_x=pan_x,
+        pan_y=pan_y,
     )
+    return QRectF(rect.x, rect.y, rect.width, rect.height)
+
+
+def _preview_viewport_rect(
+    width: int, height: int, ratio: float | None
+) -> QRectF:
+    if width <= 0 or height <= 0:
+        return QRectF()
+    viewport = QRectF(0, 0, width, height)
+    if ratio is None or ratio <= 0:
+        return viewport
+    if width / height > ratio:
+        fitted_width = height * ratio
+        return QRectF((width - fitted_width) / 2, 0, fitted_width, height)
+    fitted_height = width / ratio
+    return QRectF(0, (height - fitted_height) / 2, width, fitted_height)
 
 
 def _caption_bounds(
     caption: EditableCaption, video_rect: QRectF, font: QFont
 ) -> QRectF:
     metrics = QFontMetricsF(font)
-    max_width = video_rect.width() * 0.9
+    max_width = video_rect.width() * caption.max_width
     padding = max(2, font.pixelSize() * 0.25)
     text_width = min(max_width, metrics.horizontalAdvance(caption.text) + 2 * padding)
     line_count = max(1, _wrapped_line_count(caption.text, metrics, max_width - 2 * padding))

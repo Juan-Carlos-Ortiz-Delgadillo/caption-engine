@@ -8,9 +8,8 @@ from app.captions.segmenter import CaptionSegmenter
 from app.core.models import (
     Caption,
     CaptionStyleConfig,
-    TranscriptSegment,
-    TranscriptionOptions,
     TranscriptionResult,
+    TranscriptSegment,
     VideoMetadata,
     Word,
 )
@@ -56,6 +55,8 @@ class EditorExportTests(unittest.TestCase):
                         y=0.75,
                         scale=1.5,
                         word_spacing=4,
+                        position_override=True,
+                        scale_override=True,
                     ),
                 ),
                 edited=True,

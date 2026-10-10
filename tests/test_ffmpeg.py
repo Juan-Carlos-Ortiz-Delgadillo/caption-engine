@@ -1,3 +1,4 @@
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, call, patch
@@ -35,3 +36,42 @@ class FFmpegTests(unittest.TestCase):
             service.run(["ffmpeg"], duration=1, progress=progress)
 
         self.assertEqual(progress.call_args_list, [call(0.5), call(1.0)])
+
+    def test_render_replaces_output_only_after_temporary_render_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.mp4"
+            subtitles = root / "captions.ass"
+            output = root / "result.mp4"
+            source.touch()
+            subtitles.touch()
+            output.write_bytes(b"previous")
+            service = FFmpegService(executable="ffmpeg", probe="ffprobe")
+
+            def render_to_temporary(command, _duration, _progress):
+                Path(command[-1]).write_bytes(b"new render")
+
+            with patch.object(service, "run", side_effect=render_to_temporary) as run:
+                service.render(source, subtitles, output, 1)
+
+            self.assertEqual(output.read_bytes(), b"new render")
+            self.assertNotEqual(run.call_args.args[0][-1], str(output))
+            self.assertEqual(list(root.glob(".result.*.mp4")), [])
+
+    def test_failed_atomic_render_preserves_previous_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.mp4"
+            subtitles = root / "captions.ass"
+            output = root / "result.mp4"
+            source.touch()
+            subtitles.touch()
+            output.write_bytes(b"previous")
+            service = FFmpegService(executable="ffmpeg", probe="ffprobe")
+            with (
+                patch.object(service, "run", side_effect=RuntimeError("failed")),
+                self.assertRaisesRegex(RuntimeError, "failed"),
+            ):
+                service.render(source, subtitles, output, 1)
+            self.assertEqual(output.read_bytes(), b"previous")
+            self.assertEqual(list(root.glob(".result.*.mp4")), [])

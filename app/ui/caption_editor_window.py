@@ -7,25 +7,28 @@ import logging
 from dataclasses import asdict, replace
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QTimer, Qt, Slot
-from PySide6.QtCore import QObject, QThread, Signal
-from PySide6.QtGui import QCloseEvent, QColor, QFont, QFontDatabase, QKeyEvent
+from PySide6.QtCore import QEvent, QObject, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtGui import QCloseEvent, QColor, QFont, QFontDatabase, QKeyEvent, QPixmap
 from PySide6.QtWidgets import (
     QAbstractButton,
     QCheckBox,
     QColorDialog,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QFontComboBox,
+    QFormLayout,
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QMainWindow,
     QMessageBox,
-    QPushButton,
     QPlainTextEdit,
+    QPushButton,
     QScrollArea,
     QSlider,
     QSpinBox,
@@ -56,12 +59,16 @@ class EditorRenderWorker(QObject):
         editor: CaptionEditorService,
         metadata: VideoMetadata,
         output_directory: Path,
+        output_name: str,
+        crf: int,
     ) -> None:
         super().__init__()
         self._service = service
         self._project = editor.project
         self._metadata = metadata
         self._output_directory = output_directory
+        self._output_name = output_name
+        self._crf = crf
 
     @Slot()
     def run(self) -> None:
@@ -70,6 +77,8 @@ class EditorRenderWorker(QObject):
                 self._project,
                 self._metadata,
                 self._output_directory,
+                output_name=self._output_name,
+                crf=self._crf,
                 progress=self.progress.emit,
             )
             self.succeeded.emit(result)
@@ -142,6 +151,7 @@ class CaptionEditorWindow(QMainWindow):
         self._preview.captionSelected.connect(self._select_caption)
         self._preview.captionMoved.connect(self._on_caption_moved)
         self._preview.captionDeleted.connect(self._delete_caption_from_canvas)
+        self._preview.captionEdited.connect(self._on_project_changed)
         self._preview.frameError.connect(self._on_preview_error)
         preview_layout.addWidget(self._preview, 1)
         timeline_header = QHBoxLayout()
@@ -204,6 +214,10 @@ class CaptionEditorWindow(QMainWindow):
         self._caption_list = QListWidget()
         self._caption_list.currentRowChanged.connect(self._select_caption_row)
         layout.addWidget(self._caption_list, 1)
+        self._layout_warning = QLabel()
+        self._layout_warning.setObjectName("layoutWarning")
+        self._layout_warning.setWordWrap(True)
+        layout.addWidget(self._layout_warning)
         layout.addWidget(QLabel("Texto"))
         self._text = QPlainTextEdit()
         self._text.setMaximumHeight(80)
@@ -285,14 +299,18 @@ class CaptionEditorWindow(QMainWindow):
         grid = QGridLayout()
         self._x = self._double_spin(0, 1, 0.01, 0.5)
         self._y = self._double_spin(0, 1, 0.01, 0.82)
+        self._x.setRange(0, max(1, self._metadata.width))
+        self._y.setRange(0, max(1, self._metadata.height))
+        self._x.setDecimals(0)
+        self._y.setDecimals(0)
         self._scale = self._double_spin(0.25, 4, 0.05, 1)
         self._spacing = self._double_spin(-20, 100, 0.5, 0)
         self._rotation = self._double_spin(-180, 180, 1, 0)
         self._start = self._double_spin(0, 100000, 0.01, 0)
         self._end = self._double_spin(0.01, 100000, 0.01, 1)
         rows = (
-            ("X normalizada", self._x),
-            ("Y normalizada", self._y),
+            ("X (px de video)", self._x),
+            ("Y (px de video)", self._y),
             ("Escala", self._scale),
             ("Espaciado", self._spacing),
             ("Rotación", self._rotation),
@@ -390,6 +408,12 @@ class CaptionEditorWindow(QMainWindow):
         save_preset = QPushButton("Guardar como preset…")
         save_preset.clicked.connect(self._save_preset)
         layout.addWidget(save_preset)
+        recalculate_layout = QPushButton("Recalcular layout")
+        recalculate_layout.clicked.connect(self._relayout)
+        layout.addWidget(recalculate_layout)
+        rebuild = QPushButton("Reconstruir desde la transcripción…")
+        rebuild.clicked.connect(self._rebuild_from_transcript)
+        layout.addWidget(rebuild)
         layout.addStretch(1)
         return widget
 
@@ -469,9 +493,12 @@ class CaptionEditorWindow(QMainWindow):
         export.clicked.connect(self._export_subtitles)
         render = QPushButton("Renderizar MP4")
         render.clicked.connect(self._render_video)
+        verify = QPushButton("Verificar frame exacto")
+        verify.clicked.connect(self._verify_exact_frame)
         layout.addWidget(QLabel("Exporta el estilo actual sin volver a transcribir."))
         layout.addWidget(export)
         layout.addWidget(render)
+        layout.addWidget(verify)
         layout.addStretch(1)
         return widget
 
@@ -504,7 +531,10 @@ class CaptionEditorWindow(QMainWindow):
         self._caption_list.clear()
         selected_row = -1
         for row, caption in enumerate(project.captions):
-            self._caption_list.addItem(f"{caption.start:0.2f}–{caption.end:0.2f}  {caption.text}")
+            marker = "⚠ " if caption.layout_warning else ""
+            self._caption_list.addItem(
+                f"{marker}{caption.start:0.2f}–{caption.end:0.2f}  {caption.text}"
+            )
             if caption.caption_id == self._selected_caption_id:
                 selected_row = row
         if selected_row >= 0:
@@ -512,6 +542,9 @@ class CaptionEditorWindow(QMainWindow):
         caption = self._selected_caption()
         self._word_list.clear()
         if caption:
+            self._layout_warning.setText(
+                f"⚠ {caption.layout_warning}" if caption.layout_warning else ""
+            )
             for word in caption.words:
                 self._word_list.addItem(
                     f"{word.text}    {word.start:0.2f} → {word.end:0.2f}"
@@ -521,8 +554,8 @@ class CaptionEditorWindow(QMainWindow):
             )
             if self._text.toPlainText() != caption.text:
                 self._text.setPlainText(caption.text)
-            self._x.setValue(caption.x)
-            self._y.setValue(caption.y)
+            self._x.setValue(caption.x * self._metadata.width)
+            self._y.setValue(caption.y * self._metadata.height)
             self._scale.setValue(caption.scale)
             self._spacing.setValue(caption.word_spacing)
             self._rotation.setValue(caption.rotation_deg)
@@ -530,6 +563,7 @@ class CaptionEditorWindow(QMainWindow):
             self._end.setValue(caption.end)
         else:
             self._text.setPlainText("Default text")
+            self._layout_warning.clear()
         style = project.style_config
         available_fonts = {
             family.casefold() for family in QFontDatabase.families()
@@ -641,7 +675,7 @@ class CaptionEditorWindow(QMainWindow):
         if split_at <= 0 or split_at >= len(caption.words):
             split_at = len(caption.words) // 2
         try:
-            left_id, right_id = self._editor.split_caption(caption.caption_id, split_at)
+            _left_id, right_id = self._editor.split_caption(caption.caption_id, split_at)
         except ValueError as exc:
             QMessageBox.information(self, "No se pudo dividir", str(exc))
             return
@@ -720,7 +754,9 @@ class CaptionEditorWindow(QMainWindow):
     def _update_position(self, _value: float) -> None:
         if not self._updating_controls and self._selected_caption_id:
             self._editor.move_caption(
-                self._selected_caption_id, self._x.value(), self._y.value()
+                self._selected_caption_id,
+                self._x.value() / self._metadata.width,
+                self._y.value() / self._metadata.height,
             )
             self._on_project_changed()
 
@@ -840,6 +876,43 @@ class CaptionEditorWindow(QMainWindow):
             return
         self._on_project_changed()
 
+    @Slot()
+    def _relayout(self) -> None:
+        try:
+            self._editor.relayout()
+        except (ValueError, RuntimeError) as exc:
+            QMessageBox.warning(self, "No se pudo recalcular el layout", str(exc))
+            return
+        self._on_project_changed()
+
+    @Slot()
+    def _rebuild_from_transcript(self) -> None:
+        answer = QMessageBox.question(
+            self,
+            "Reconstruir captions",
+            "Se reemplazarán los captions actuales con una nueva segmentación "
+            "de transcript.json y se perderán sus ediciones. ¿Continuar?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            transcript_path = self._project_path.with_name("transcript.json")
+            transcript = (
+                self._export_service.load_transcript(transcript_path)
+                if transcript_path.is_file()
+                else None
+            )
+            self._editor.rebuild_from_transcript(transcript)
+        except (OSError, ValueError, RuntimeError) as exc:
+            QMessageBox.warning(self, "No se pudo reconstruir", str(exc))
+            return
+        captions = self._editor.project.captions
+        self._selected_caption_id = captions[0].caption_id if captions else None
+        self._selected_word_index = 0
+        self._on_project_changed()
+
     def _save_preset(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
             self, "Guardar preset de estilo", "caption-style.json", "JSON (*.json)"
@@ -871,8 +944,8 @@ class CaptionEditorWindow(QMainWindow):
         caption = self._selected_caption()
         if caption is not None:
             self._updating_controls = True
-            self._x.setValue(caption.x)
-            self._y.setValue(caption.y)
+            self._x.setValue(caption.x * self._metadata.width)
+            self._y.setValue(caption.y * self._metadata.height)
             self._scale.setValue(caption.scale)
             self._rotation.setValue(caption.rotation_deg)
             self._updating_controls = False
@@ -940,6 +1013,48 @@ class CaptionEditorWindow(QMainWindow):
             return
         if self._render_thread is not None:
             return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Exportar video")
+        form = QFormLayout(dialog)
+        name = QLineEdit("video_captioned.mp4", dialog)
+        directory = QLineEdit(str(self._project_path.parent), dialog)
+        choose_directory = QPushButton("Elegir…", dialog)
+        choose_directory.clicked.connect(
+            lambda: directory.setText(
+                QFileDialog.getExistingDirectory(
+                    dialog, "Carpeta de exportación", directory.text()
+                )
+                or directory.text()
+            )
+        )
+        directory_row = QHBoxLayout()
+        directory_row.addWidget(directory, 1)
+        directory_row.addWidget(choose_directory)
+        quality = QComboBox(dialog)
+        quality.addItem("Alta calidad", 18)
+        quality.addItem("Equilibrada", 20)
+        quality.addItem("Archivo pequeño", 25)
+        form.addRow("Nombre del archivo", name)
+        form.addRow("Carpeta", directory_row)
+        form.addRow("Calidad", quality)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel,
+            parent=dialog,
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        output_directory = Path(directory.text()).expanduser()
+        output_name = Path(name.text()).name
+        if not output_directory.is_dir():
+            QMessageBox.warning(self, "Carpeta no válida", "Elige una carpeta de exportación existente.")
+            return
+        if not output_name or output_name in {".", ".."}:
+            QMessageBox.warning(self, "Nombre no válido", "Escribe un nombre de archivo.")
+            return
         self._save_timer.stop()
         if not self._save_project():
             return
@@ -950,7 +1065,9 @@ class CaptionEditorWindow(QMainWindow):
             self._export_service,
             self._editor,
             self._metadata,
-            self._project_path.parent,
+            output_directory,
+            output_name,
+            int(quality.currentData()),
         )
         self._render_worker.moveToThread(self._render_thread)
         self._render_thread.started.connect(self._render_worker.run)
@@ -962,6 +1079,49 @@ class CaptionEditorWindow(QMainWindow):
         self._render_thread.finished.connect(self._render_thread.deleteLater)
         self._render_thread.finished.connect(self._on_render_finished)
         self._render_thread.start()
+
+    @Slot()
+    def _verify_exact_frame(self) -> None:
+        if not self._require_installed_font():
+            return
+        try:
+            image_data = self._render_preview_frame(self._preview.position)
+        except Exception as exc:
+            logger.exception("No se pudo verificar el fotograma exacto")
+            QMessageBox.critical(
+                self,
+                "Verificación fallida",
+                f"No se pudo generar el fotograma con FFmpeg/libass:\n{exc}",
+            )
+            return
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(image_data):
+            QMessageBox.critical(
+                self, "Verificación fallida", "FFmpeg devolvió una imagen no válida."
+            )
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Frame exacto · {self._preview.position:.3f} s")
+        layout = QVBoxLayout(dialog)
+        image = QLabel(dialog)
+        image.setPixmap(
+            pixmap.scaled(
+                960,
+                600,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+        layout.addWidget(image)
+        layout.addWidget(QLabel(
+            "Render FFmpeg/libass del mismo ASS usado en la exportación. "
+            "Compáralo con el preview del editor."
+        ))
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=dialog)
+        buttons.rejected.connect(dialog.reject)
+        buttons.accepted.connect(dialog.accept)
+        layout.addWidget(buttons)
+        dialog.exec()
 
     def _require_installed_font(self) -> bool:
         if not self._missing_font:
@@ -1067,6 +1227,25 @@ class CaptionEditorWindow(QMainWindow):
 
         key = event.key()
         modifiers = event.modifiers()
+        if key in {
+            Qt.Key.Key_Left,
+            Qt.Key.Key_Right,
+            Qt.Key.Key_Up,
+            Qt.Key.Key_Down,
+        } and self._preview.selected_caption_id:
+            step = 10 if modifiers & Qt.KeyboardModifier.ShiftModifier else 1
+            dx = (
+                -step if key == Qt.Key.Key_Left
+                else step if key == Qt.Key.Key_Right
+                else 0
+            )
+            dy = (
+                -step if key == Qt.Key.Key_Up
+                else step if key == Qt.Key.Key_Down
+                else 0
+            )
+            self._preview.move_selected_caption(dx, dy)
+            return True
         command = bool(
             modifiers
             & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier)

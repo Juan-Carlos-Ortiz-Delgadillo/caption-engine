@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
-from math import isfinite
 from collections.abc import Callable, Sequence
+from math import isfinite
 from pathlib import Path
 
 from app.core.exceptions import DependencyError, RenderingError
@@ -94,35 +95,51 @@ class FFmpegService:
         output: Path,
         duration: float,
         progress: ProgressCallback | None = None,
+        *,
+        preset: str = "medium",
+        crf: int = 20,
     ) -> None:
         if not self.executable:
             raise DependencyError("No se encontró FFmpeg. Instálalo o configura su ubicación.")
         if not source.is_file() or not subtitles.is_file():
             raise RenderingError("No se encontró el video o el archivo de subtítulos.")
         output.parent.mkdir(parents=True, exist_ok=True)
-        command = [
-            self.executable,
-            "-y",
-            "-i",
-            str(source),
-            "-vf",
-            f"ass=filename='{_escape_filter_path(subtitles)}'",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            "20",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-progress",
-            "pipe:1",
-            "-nostats",
-            str(output),
-        ]
-        self.run(command, duration, progress)
+        with tempfile.NamedTemporaryFile(
+            dir=output.parent,
+            prefix=f".{output.stem}.",
+            suffix=output.suffix,
+            delete=False,
+        ) as temporary_file:
+            temporary_output = Path(temporary_file.name)
+        try:
+            command = [
+                self.executable,
+                "-y",
+                "-i",
+                str(source),
+                "-vf",
+                f"ass=filename='{_escape_filter_path(subtitles)}'",
+                "-c:v",
+                "libx264",
+                "-preset",
+                preset,
+                "-crf",
+                str(crf),
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-progress",
+                "pipe:1",
+                "-nostats",
+                str(temporary_output),
+            ]
+            self.run(command, duration, progress)
+            if not temporary_output.is_file() or temporary_output.stat().st_size == 0:
+                raise RenderingError("FFmpeg no produjo un archivo de video válido.")
+            os.replace(temporary_output, output)
+        finally:
+            temporary_output.unlink(missing_ok=True)
 
     def preview_frame(self, source: Path, subtitles: Path, seconds: float) -> bytes:
         if not self.executable:

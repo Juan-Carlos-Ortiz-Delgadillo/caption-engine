@@ -16,9 +16,9 @@ from app.captions.segmenter import CaptionSegmenter
 from app.core.models import (
     Caption,
     CaptionStyleConfig,
-    TranscriptSegment,
     TranscriptionOptions,
     TranscriptionResult,
+    TranscriptSegment,
     VideoMetadata,
     Word,
 )
@@ -99,7 +99,7 @@ class CaptionEditorWindowTests(unittest.TestCase):
             window._undo()
             self.assertEqual(len(editor.project.captions), 1)
             window._save_project()
-            self.assertEqual(json.loads(project_path.read_text())["version"], 2)
+            self.assertEqual(json.loads(project_path.read_text())["version"], 4)
             window.close()
             self.application.processEvents()
 

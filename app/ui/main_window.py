@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import replace
+from html import escape
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QSettings, QThread, QUrl, Qt, Signal, Slot
+from PySide6.QtCore import QObject, QSettings, Qt, QThread, Signal, Slot
 from PySide6.QtGui import (
-    QColor,
     QCloseEvent,
-    QDesktopServices,
+    QColor,
     QDragEnterEvent,
     QDropEvent,
     QFont,
@@ -27,22 +28,23 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
     QSpinBox,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from app.core.exceptions import CaptionStudioError
 from app.core.models import CaptionStyleConfig, TranscriptionOptions, VideoMetadata
-from app.editor.models import CaptionEditorProject
 from app.editor.service import CaptionEditorService
 from app.services.environment import EnvironmentReport, EnvironmentService
-from app.services.pipeline import CaptionApplicationService, PipelineResult
+from app.services.pipeline import CaptionApplicationService
 from app.styles.registry import StyleRegistry
 from app.ui.caption_editor_window import CaptionEditorWindow
 from app.ui.theme import STYLESHEET
@@ -57,15 +59,15 @@ class PipelineWorker(QObject):
     failed = Signal(str)
     finished = Signal()
 
-    def __init__(self, service: CaptionApplicationService, args: tuple) -> None:
+    def __init__(self, operation: Callable, args: tuple) -> None:
         super().__init__()
-        self._service = service
+        self._operation = operation
         self._args = args
 
     @Slot()
     def run(self) -> None:
         try:
-            result = self._service.generate(*self._args, progress=self.progress.emit)
+            result = self._operation(*self._args, progress=self.progress.emit)
             self.succeeded.emit(result)
         except Exception as exc:
             logger.exception("Falló el flujo de generación")
@@ -90,6 +92,12 @@ class MainWindow(QMainWindow):
         self._environment = environment
         self._report: EnvironmentReport | None = None
         self._video: Path | None = None
+        self._transcript = None
+        self._metadata: VideoMetadata | None = None
+        self._workspace: Path | None = None
+        self._reusable_transcript: Path | None = None
+        self._pending_operation = ""
+        self._current_step = 0
         self._thread: QThread | None = None
         self._worker: PipelineWorker | None = None
         self._preview_window: CaptionEditorWindow | None = None
@@ -118,32 +126,67 @@ class MainWindow(QMainWindow):
         open_project = QPushButton("Abrir proyecto…")
         open_project.clicked.connect(self._open_project)
         header.addWidget(open_project)
+        recent_button = QPushButton("Proyectos recientes")
+        recent_button.clicked.connect(self._show_recent_projects)
+        header.addWidget(recent_button)
         header.addStretch(1)
         self._environment_badge = QLabel("Verificando entorno…")
         self._environment_badge.setObjectName("environmentBadge")
         header.addWidget(self._environment_badge)
         outer.addLayout(header)
 
-        scroll = QScrollArea()
-        scroll.setObjectName("contentScroll")
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        page = QWidget()
-        page.setObjectName("contentPage")
-        page_layout = QVBoxLayout(page)
-        page_layout.setContentsMargins(2, 2, 8, 8)
-        page_layout.setSpacing(14)
-        page_layout.addWidget(self._card("1 · VIDEO", self._video_card()))
-        page_layout.addWidget(self._card("2 · TRANSCRIPCIÓN", self._transcription_card()))
-        page_layout.addWidget(self._card("3 · ESTILO", self._style_card()))
-        page_layout.addWidget(self._card("ENTORNO DE EJECUCIÓN", self._environment_card()))
-        page_layout.addStretch(1)
-        scroll.setWidget(page)
-        outer.addWidget(scroll, 1)
+        self._step_heading = QLabel()
+        self._step_heading.setObjectName("section")
+        outer.addWidget(self._step_heading)
+        self._pages = QStackedWidget()
+        self._pages.setObjectName("workflowPages")
 
-        generation_label = QLabel("4 · GENERACIÓN")
-        generation_label.setObjectName("section")
-        outer.addWidget(generation_label)
+        video_page = QWidget()
+        video_layout = QVBoxLayout(video_page)
+        video_layout.addWidget(self._card("VIDEO", self._video_card()))
+        video_layout.addWidget(self._card("ENTORNO DE EJECUCIÓN", self._environment_card()))
+        video_layout.addStretch(1)
+        self._pages.addWidget(self._scroll_page(video_page))
+
+        transcription_page = QWidget()
+        transcription_layout = QVBoxLayout(transcription_page)
+        transcription_layout.addWidget(
+            self._card("OPCIONES DE TRANSCRIPCIÓN", self._transcription_card())
+        )
+        self._transcript_status = QLabel("Todavía no hay una transcripción para este video.")
+        self._transcript_status.setObjectName("hint")
+        self._transcript_status.setWordWrap(True)
+        transcription_layout.addWidget(self._transcript_status)
+        transcription_layout.addStretch(1)
+        self._pages.addWidget(self._scroll_page(transcription_page))
+
+        style_page = QWidget()
+        style_layout = QVBoxLayout(style_page)
+        style_layout.addWidget(self._card("ESTILO", self._style_card()))
+        self._style_preview = QLabel(
+            "La vista previa usará palabras reales del transcript."
+        )
+        self._style_preview.setObjectName("stylePreview")
+        self._style_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._style_preview.setWordWrap(True)
+        self._style_preview.setMinimumHeight(120)
+        self._style_preview.setTextFormat(Qt.TextFormat.RichText)
+        style_layout.addWidget(self._card("VISTA PREVIA", self._style_preview))
+        style_layout.addStretch(1)
+        self._pages.addWidget(self._scroll_page(style_page))
+
+        generation_page = QWidget()
+        generation_layout = QVBoxLayout(generation_page)
+        self._generation_summary = QLabel(
+            "Se crearán los captions y su layout. No se exportará ASS/SRT ni se renderizará video."
+        )
+        self._generation_summary.setObjectName("hint")
+        self._generation_summary.setWordWrap(True)
+        generation_layout.addWidget(self._card("GENERACIÓN", self._generation_summary))
+        generation_layout.addStretch(1)
+        self._pages.addWidget(self._scroll_page(generation_page))
+        outer.addWidget(self._pages, 1)
+
         self._status = QLabel("Selecciona o arrastra un video para comenzar.")
         self._status.setObjectName("status")
         self._status.setWordWrap(True)
@@ -153,19 +196,37 @@ class MainWindow(QMainWindow):
         self._progress.setValue(0)
         self._progress.setTextVisible(False)
         outer.addWidget(self._progress)
-        self._generate = QPushButton("Generar subtítulos y video")
+        self._back = QPushButton("Anterior")
+        self._back.clicked.connect(self._previous_step)
+        self._next = QPushButton("Siguiente")
+        self._next.setObjectName("primary")
+        self._next.setMinimumHeight(46)
+        self._next.clicked.connect(self._next_step)
+        self._generate = QPushButton("Crear proyecto y abrir editor")
         self._generate.setObjectName("primary")
         self._generate.setMinimumHeight(46)
-        self._generate.clicked.connect(self._start)
+        self._generate.clicked.connect(self._start_layout)
         self._close_button = QPushButton("Cerrar aplicación")
         self._close_button.setObjectName("closeApplication")
         self._close_button.clicked.connect(self.close)
         actions = QHBoxLayout()
         actions.setSpacing(10)
+        actions.addWidget(self._back)
+        actions.addWidget(self._next, 1)
         actions.addWidget(self._generate, 1)
         actions.addWidget(self._close_button)
         outer.addLayout(actions)
         self.setCentralWidget(root)
+        self._show_step(0)
+
+    @staticmethod
+    def _scroll_page(page: QWidget) -> QScrollArea:
+        scroll = QScrollArea()
+        scroll.setObjectName("contentScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(page)
+        return scroll
 
     @staticmethod
     def _card(title: str, content: QWidget) -> QFrame:
@@ -369,6 +430,14 @@ class MainWindow(QMainWindow):
         self._font_size.valueChanged.connect(self._save_preferences)
         self._position.currentIndexChanged.connect(self._save_preferences)
         self._uppercase.toggled.connect(self._save_preferences)
+        for control, signal in (
+            (self._style, self._style.currentIndexChanged),
+            (self._font, self._font.currentFontChanged),
+            (self._font_size, self._font_size.valueChanged),
+            (self._position, self._position.currentIndexChanged),
+            (self._uppercase, self._uppercase.toggled),
+        ):
+            signal.connect(self._refresh_style_preview)
 
     @staticmethod
     def _select_combo_data(combo: QComboBox, data: str) -> None:
@@ -457,12 +526,18 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Video no válido", "Selecciona un archivo de video existente.")
             return
         self._video = path
+        self._transcript = None
+        self._metadata = None
+        self._workspace = None
+        self._reusable_transcript = None
+        self._transcript_status.setText("Todavía no hay una transcripción para este video.")
         self._last_folder = path.parent
         self._settings.setValue("last_folder", str(path.parent))
         self._video_label.setText(path.name)
         self._elide_video_name()
         self._video_label.setToolTip(str(path))
         self._status.setText(f"Video seleccionado · {path.name}")
+        self._show_step(0)
         self._update_generate_button()
 
     def resizeEvent(self, event) -> None:
@@ -499,6 +574,7 @@ class MainWindow(QMainWindow):
         if selected.isValid():
             self._colors[name] = selected.name().upper()
             self._set_color_button(name)
+            self._refresh_style_preview()
 
     def _set_color_button(self, name: str) -> None:
         button = self._color_buttons[name]
@@ -512,40 +588,173 @@ class MainWindow(QMainWindow):
         ready = bool(self._video and self._report and self._report.ready)
         busy = self._thread is not None
         self._generate.setEnabled(ready and not busy)
+        self._next.setEnabled(bool(self._video) and not busy)
+        self._back.setEnabled(self._current_step > 0 and not busy)
+        self._generate.setVisible(self._current_step == 3)
+        self._next.setVisible(self._current_step < 3)
         if not self._report or not self._report.ready:
             return
         if not self._video:
             self._status.setText("Selecciona o arrastra un video para comenzar.")
 
+    def _show_step(self, step: int) -> None:
+        self._current_step = min(3, max(0, step))
+        self._pages.setCurrentIndex(self._current_step)
+        names = ("VIDEO", "TRANSCRIPCIÓN", "ESTILO", "GENERACIÓN")
+        self._step_heading.setText(f"PASO {self._current_step + 1} DE 4 · {names[self._current_step]}")
+        self._back.setEnabled(self._current_step > 0 and self._thread is None)
+        self._next.setVisible(self._current_step < 3)
+        self._generate.setVisible(self._current_step == 3)
+        self._next.setText(
+            "Transcribir" if self._current_step == 1 and self._transcript is None
+            else "Siguiente"
+        )
+        self._update_generate_button()
+
     @Slot()
-    def _start(self) -> None:
-        if not self._video or not self._report or not self._report.ready:
+    def _previous_step(self) -> None:
+        if self._current_step:
+            self._show_step(self._current_step - 1)
+
+    @Slot()
+    def _next_step(self) -> None:
+        if self._current_step == 0:
+            if self._video:
+                self._show_step(1)
             return
-        options = TranscriptionOptions(
+        if self._current_step == 1:
+            if self._transcript is None:
+                self._start_transcription()
+            else:
+                self._show_step(2)
+            return
+        if self._current_step == 2:
+            self._refresh_style_preview()
+            self._generation_summary.setText(
+                f"Video: {self._video.name if self._video else '—'}\n"
+                f"Palabras: {len(self._transcript.words) if self._transcript else 0}\n"
+                f"Estilo: {self._style.currentText()}\n\n"
+                "Se crearán los captions y su layout. No se exportará ASS/SRT ni se renderizará video."
+            )
+            self._show_step(3)
+
+    def _options(self) -> TranscriptionOptions:
+        return TranscriptionOptions(
             model=self._model.currentText(),
             language=self._language.currentData() or None,
             device=self._device.currentData(),
             compute_type=self._compute_type.currentText(),
         )
-        config = CaptionStyleConfig(
+
+    def _style_config(self) -> CaptionStyleConfig:
+        return CaptionStyleConfig(
             font_family=self._font.currentFont().family(),
             font_size=self._font_size.value(),
             position=self._position.currentData(),
             uppercase=self._uppercase.isChecked(),
             **self._colors,
         )
-        output_root = Path.home() / "Movies" / "Animated Caption Studio"
+
+    def _output_root(self) -> Path:
+        return Path.home() / "Movies" / "Animated Caption Studio"
+
+    def _start_transcription(self) -> None:
+        if not self._video or not self._report or not self._report.ready:
+            return
+        if self._workspace is None:
+            try:
+                self._workspace = self._service.create_workspace(
+                    self._output_root(), self._video
+                )
+            except OSError as exc:
+                logger.exception("No se pudo crear el espacio de trabajo")
+                QMessageBox.critical(
+                    self,
+                    "No se pudo iniciar la transcripción",
+                    f"No se pudo crear la carpeta del proyecto:\n{exc}",
+                )
+                return
+        if self._reusable_transcript is None:
+            candidates = self._service.reusable_transcripts(
+                self._video,
+                self._output_root(),
+                tuple(Path(item) for item in self._recent_project_paths()),
+            )
+            if candidates:
+                answer = QMessageBox.question(
+                    self,
+                    "Transcripción existente",
+                    "Ya existe transcript.json para este video. ¿Quieres reutilizarlo?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if answer == QMessageBox.StandardButton.Yes:
+                    self._reusable_transcript = candidates[0]
+
+        self._pending_operation = "transcription"
+        self._next.setEnabled(False)
         self._generate.setEnabled(False)
         self._progress.setValue(0)
         self._thread = QThread(self)
         self._worker = PipelineWorker(
-            self._service,
-            (self._video, output_root, options, self._style.currentData(), config),
+            self._service.transcribe_to_workspace,
+            (
+                self._video,
+                self._workspace,
+                self._options(),
+                self._reusable_transcript,
+            ),
         )
+        self._start_worker()
+
+    @Slot()
+    def _start_layout(self) -> None:
+        if (
+            not self._video
+            or self._transcript is None
+            or self._metadata is None
+            or self._workspace is None
+            or self._thread is not None
+        ):
+            return
+        if (self._workspace / "project.acs").is_file():
+            try:
+                workspace = self._service.create_workspace(
+                    self._output_root(), self._video
+                )
+                self._service.save_transcript(self._transcript, workspace)
+            except OSError as exc:
+                logger.exception("No se pudo crear una nueva revisión del proyecto")
+                QMessageBox.critical(
+                    self,
+                    "No se pudo preparar el proyecto",
+                    f"No se pudo guardar la transcripción para una nueva revisión:\n{exc}",
+                )
+                return
+            self._workspace = workspace
+        self._pending_operation = "layout"
+        self._generate.setEnabled(False)
+        self._progress.setValue(0)
+        self._worker = PipelineWorker(
+            self._service.build_editor_project,
+            (
+                self._video,
+                self._transcript,
+                self._options(),
+                self._style.currentData(),
+                self._style_config(),
+                self._metadata,
+            ),
+        )
+        self._start_worker()
+
+    def _start_worker(self) -> None:
+        assert self._worker is not None
+        self._thread = QThread(self)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.progress.connect(self._on_progress)
-        self._worker.succeeded.connect(self._on_success)
+        self._worker.succeeded.connect(self._on_operation_success)
         self._worker.failed.connect(self._on_failure)
         self._worker.finished.connect(self._thread.quit)
         self._worker.finished.connect(self._worker.deleteLater)
@@ -559,41 +768,32 @@ class MainWindow(QMainWindow):
         self._progress.setValue(value)
 
     @Slot(object)
-    def _on_success(self, result: PipelineResult) -> None:
-        self._status.setText(f"Finalizado · {result.output_directory}")
+    def _on_operation_success(self, result: object) -> None:
         self._progress.setValue(100)
-        dialog = QMessageBox(self)
-        dialog.setWindowTitle("Generación completada")
-        dialog.setText("Se generaron el video, ASS, SRT, transcript.json y project.acs.")
-        preview_button = dialog.addButton("Abrir editor", QMessageBox.ButtonRole.ActionRole)
-        actions = (
-            ("Abrir video", result.video),
-            ("Abrir carpeta", result.output_directory),
-            ("Abrir ASS", result.ass),
-            ("Abrir SRT", result.srt),
-        )
-        buttons = [
-            (dialog.addButton(label, QMessageBox.ButtonRole.ActionRole), path)
-            for label, path in actions
-        ]
-        dialog.addButton("Cerrar", QMessageBox.ButtonRole.RejectRole)
-        dialog.exec()
-        if dialog.clickedButton() is preview_button:
-            project = CaptionEditorProject.create(
-                result.source_video,
-                result.transcription,
-                result.captions,
-                result.style_id,
-                result.style_config,
-                result.transcription_options,
-                result.metadata,
+        if self._pending_operation == "transcription":
+            self._transcript, self._metadata, transcript_path = result
+            reused = self._reusable_transcript is not None
+            self._transcript_status.setText(
+                f"{'Transcripción reutilizada' if reused else 'Transcripción lista'} · "
+                f"{len(self._transcript.words)} palabras guardadas en {transcript_path}"
             )
-            self._show_editor(CaptionEditorService(project), result.project)
+            self._refresh_style_preview()
+            self._status.setText("Transcripción lista. Puedes continuar al estilo.")
+            self._show_step(2)
             return
-        for button, path in buttons:
-            if dialog.clickedButton() is button:
-                QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
-                break
+
+        if self._pending_operation == "layout":
+            project_path = self._workspace / "project.acs"
+            editor = CaptionEditorService(result)
+            try:
+                editor.save(project_path)
+            except OSError as exc:
+                logger.exception("No se pudo guardar el proyecto inicial")
+                QMessageBox.critical(self, "Error al guardar", str(exc))
+                return
+            self._add_recent_project(project_path)
+            self._status.setText("Layout listo · abriendo Caption Editor.")
+            self._show_editor(editor, project_path, self._metadata)
 
     @Slot()
     def _open_project(self) -> None:
@@ -605,7 +805,39 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        project_path = Path(path)
+        self._open_project_path(Path(path))
+
+    def _recent_project_paths(self) -> list[str]:
+        value = self._settings.value("recent_projects", [])
+        paths = [value] if isinstance(value, str) else list(value or [])
+        return [str(Path(item).expanduser()) for item in paths]
+
+    def _add_recent_project(self, path: Path) -> None:
+        paths = [str(path)] + [
+            item for item in self._recent_project_paths() if Path(item) != path
+        ]
+        paths = [item for item in paths if Path(item).is_file()][:10]
+        self._settings.setValue("recent_projects", paths)
+
+    def _show_recent_projects(self) -> None:
+        menu = QMenu(self)
+        paths = [Path(item) for item in self._recent_project_paths()]
+        existing = [path for path in paths if path.is_file()]
+        if not existing:
+            action = menu.addAction("No hay proyectos recientes")
+            action.setEnabled(False)
+        else:
+            for path in existing:
+                action = menu.addAction(f"{path.parent.name} — {path.name}")
+                action.setToolTip(str(path))
+                action.triggered.connect(
+                    lambda _checked=False, project_path=path: self._open_project_path(
+                        project_path
+                    )
+                )
+        menu.exec(self.mapToGlobal(self.rect().topLeft()))
+
+    def _open_project_path(self, project_path: Path) -> None:
         try:
             editor = CaptionEditorService.load(project_path)
             project = editor.project
@@ -636,12 +868,44 @@ class MainWindow(QMainWindow):
         self._preview_window = CaptionEditorWindow(
             editor, metadata, project_path, self._service, self
         )
+        self._add_recent_project(project_path)
         self._preview_window.show()
+
+    def _refresh_style_preview(self, *_args) -> None:
+        if self._transcript is None:
+            text = "La vista previa usará palabras reales del transcript."
+        else:
+            words = [word.text for word in self._transcript.words[:6]]
+            if not words:
+                text = "No se detectaron palabras en la transcripción."
+            else:
+                behavior = StyleRegistry().get(self._style.currentData()).behavior
+                rendered_words = [escape(word) for word in words]
+                if behavior != "minimal":
+                    rendered_words[0] = (
+                        f'<span style="color:{self._colors["highlight_color"]}">'
+                        f"{rendered_words[0]}</span>"
+                    )
+                text = " ".join(rendered_words)
+        self._style_preview.setText(text)
+        font = QFont(self._font.currentFont())
+        font.setPointSize(max(10, min(42, round(self._font_size.value() * 0.48))))
+        font.setBold(self._style.currentData() == "bold_highlight")
+        self._style_preview.setFont(font)
+        self._style_preview.setStyleSheet(
+            f"QLabel {{ color: {self._colors['primary_color']}; "
+            "background-color: #20232b; border-radius: 8px; padding: 16px; }"
+        )
 
     @Slot(str)
     def _on_failure(self, message: str) -> None:
-        self._status.setText("La generación no se completó.")
-        QMessageBox.critical(self, "Error de generación", message)
+        label = (
+            "La transcripción no se completó."
+            if self._pending_operation == "transcription"
+            else "No se pudo preparar el proyecto."
+        )
+        self._status.setText(label)
+        QMessageBox.critical(self, "Error del flujo de trabajo", message)
 
     @Slot()
     def _on_finished(self) -> None:
