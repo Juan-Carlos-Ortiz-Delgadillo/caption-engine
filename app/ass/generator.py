@@ -18,10 +18,16 @@ class ASSGenerator:
         width: int = 1920,
         height: int = 1080,
         caption_layouts: tuple[tuple[float, ...], ...] | None = None,
+        caption_font_sizes: tuple[int, ...] | None = None,
     ) -> str:
         validate_captions(captions)
         if caption_layouts is not None and len(caption_layouts) != len(captions):
             raise ValueError("Debe proporcionarse una posición para cada caption.")
+        if caption_font_sizes is not None and (
+            len(caption_font_sizes) != len(captions)
+            or any(not 8 <= font_size <= config.font_size for font_size in caption_font_sizes)
+        ):
+            raise ValueError("Debe proporcionarse un tamaño de fuente válido para cada caption.")
         style = self._registry.get(style_id)
         highlight_enabled = (
             config.highlight_enabled
@@ -35,6 +41,31 @@ class ASSGenerator:
         )
         alignment = {"bottom": 2, "center": 5, "top": 8}[config.position]
         margin_v = config.margin_vertical
+        outline_width = (
+            max(config.outline_width, config.bubble_padding)
+            if config.bubble_enabled
+            else config.outline_width
+        )
+        default_style = (
+            f"Style: Default,{_ass_text(config.font_family)},{config.font_size},"
+            f"{_ass_color(config.primary_color)},{_ass_color(config.highlight_color)},"
+            f"{_ass_color(config.outline_color)},"
+            f"{_ass_color(config.background_color, 100 - config.bubble_opacity)},"
+            f"{-1 if config.bold or style.behavior == 'highlight' else 0},"
+            f"{-1 if config.italic else 0},{-1 if config.underline else 0},0,100,100,"
+            f"0,0,{3 if config.bubble_enabled else 1},{outline_width:g},"
+            f"{config.shadow_depth:g},{alignment},50,50,"
+            f"{margin_v},1"
+        )
+        fit_styles = []
+        if caption_font_sizes is not None:
+            style_properties = default_style.split(",", 3)[3]
+            fit_styles = [
+                f"Style: CaptionFit{font_size},{_ass_text(config.font_family)},{font_size},"
+                f"{style_properties}"
+                for font_size in sorted(set(caption_font_sizes))
+                if font_size != config.font_size
+            ]
         header = [
             "[Script Info]",
             "ScriptType: v4.00+",
@@ -48,18 +79,8 @@ class ASSGenerator:
             "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, "
             "ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
             "MarginL, MarginR, MarginV, Encoding",
-            (
-                f"Style: Default,{_ass_text(config.font_family)},{config.font_size},"
-                f"{_ass_color(config.primary_color)},{_ass_color(config.highlight_color)},"
-                f"{_ass_color(config.outline_color)},"
-                f"{_ass_color(config.background_color, 100 - config.bubble_opacity)},"
-                f"{-1 if config.bold or style.behavior == 'highlight' else 0},"
-                f"{-1 if config.italic else 0},{-1 if config.underline else 0},0,100,100,"
-                f"0,0,{3 if config.bubble_enabled else 1},"
-                f"{max(config.outline_width, config.bubble_padding) if config.bubble_enabled else config.outline_width:g},"
-                f"{config.shadow_depth:g},{alignment},50,50,"
-                f"{margin_v},1"
-            ),
+            default_style,
+            *fit_styles,
             "",
             "[Events]",
             "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
@@ -68,6 +89,12 @@ class ASSGenerator:
         for caption_index, caption in enumerate(captions):
             layout = caption_layouts[caption_index] if caption_layouts is not None else None
             position = _position_tag(layout, width, height) if layout is not None else ""
+            font_size = (
+                caption_font_sizes[caption_index]
+                if caption_font_sizes is not None
+                else config.font_size
+            )
+            style_name = "Default" if font_size == config.font_size else f"CaptionFit{font_size}"
             effects = _effect_tag(config)
             lines = _word_lines(caption.words, caption.line_breaks)
             if len(lines) > 1 and config.line_spacing > 0 and layout is not None:
@@ -106,13 +133,14 @@ class ASSGenerator:
                     fade_enabled,
                     effects,
                     config,
+                    style_name,
                 )
                 continue
             if style.behavior == "karaoke" and highlight_enabled:
                 text = _karaoke_text(caption.words, config, caption.line_breaks)
                 animation = fade_in(config.animation_duration_ms) if fade_enabled else ""
                 text = position + effects + animation + text
-                events.append(_event(caption.start, caption.end, text))
+                events.append(_event(caption.start, caption.end, text, style_name))
             elif style.behavior == "one_word":
                 for word in caption.words:
                     text = _format_word(word.text, config)
@@ -120,7 +148,7 @@ class ASSGenerator:
                     if fade_enabled:
                         animation += fade_in(config.animation_duration_ms)
                     text = position + effects + animation + text
-                    events.append(_event(word.start, word.end, text))
+                    events.append(_event(word.start, word.end, text, style_name))
             elif not highlight_enabled:
                 text = _join_words(
                     tuple(_format_word(word.text, config) for word in caption.words),
@@ -129,7 +157,14 @@ class ASSGenerator:
                 animation = pop(config.animation_duration_ms) if style.behavior == "pop" else ""
                 if fade_enabled:
                     animation += fade_in(config.animation_duration_ms)
-                events.append(_event(caption.start, caption.end, position + effects + animation + text))
+                events.append(
+                    _event(
+                        caption.start,
+                        caption.end,
+                        position + effects + animation + text,
+                        style_name,
+                    )
+                )
             else:
                 for active_index, word in enumerate(caption.words):
                     prefix = pop(config.animation_duration_ms) if style.behavior == "pop" else ""
@@ -138,7 +173,14 @@ class ASSGenerator:
                     text = _highlighted_text(
                         caption.words, active_index, config, caption.line_breaks
                     )
-                    events.append(_event(word.start, word.end, position + effects + prefix + text))
+                    events.append(
+                        _event(
+                            word.start,
+                            word.end,
+                            position + effects + prefix + text,
+                            style_name,
+                        )
+                    )
         return "\n".join((*header, *events, ""))
 
 
@@ -152,13 +194,19 @@ def _append_separate_line_events(
     fade_enabled: bool,
     effects: str,
     config: CaptionStyleConfig,
+    style_name: str,
 ) -> None:
     if behavior == "karaoke" and highlight_enabled:
         for (start_index, words), position in zip(lines, positions):
             text = _karaoke_text(words, config)
             animation = fade_in(config.animation_duration_ms) if fade_enabled else ""
             events.append(
-                _event(caption.start, caption.end, position + effects + animation + text)
+                _event(
+                    caption.start,
+                    caption.end,
+                    position + effects + animation + text,
+                    style_name,
+                )
             )
     elif behavior == "one_word":
         for (start_index, words), position in zip(lines, positions):
@@ -171,6 +219,7 @@ def _append_separate_line_events(
                         word.start,
                         word.end,
                         position + effects + animation + _format_word(word.text, config),
+                        style_name,
                     )
                 )
     elif not highlight_enabled:
@@ -180,7 +229,12 @@ def _append_separate_line_events(
             if fade_enabled:
                 animation += fade_in(config.animation_duration_ms)
             events.append(
-                _event(caption.start, caption.end, position + effects + animation + text)
+                _event(
+                    caption.start,
+                    caption.end,
+                    position + effects + animation + text,
+                    style_name,
+                )
             )
     else:
         for active_index, active_word in enumerate(caption.words):
@@ -198,6 +252,7 @@ def _append_separate_line_events(
                         active_word.start,
                         active_word.end,
                         position + effects + prefix + text,
+                        style_name,
                     )
                 )
 
@@ -260,8 +315,8 @@ def _format_word(text: str, config: CaptionStyleConfig) -> str:
     return text.replace("\\", r"\\").replace("{", r"\{").replace("}", r"\}")
 
 
-def _event(start: float, end: float, text: str) -> str:
-    return f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Default,,0,0,0,,{text}"
+def _event(start: float, end: float, text: str, style_name: str = "Default") -> str:
+    return f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},{style_name},,0,0,0,,{text}"
 
 
 def _ass_time(seconds: float) -> str:

@@ -1,6 +1,7 @@
 """Adaptador lazy de faster-whisper, sin filtrar sus objetos fuera del motor."""
 
 import logging
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +10,11 @@ from app.core.models import TranscriptSegment, TranscriptionOptions, Transcripti
 from app.transcription.base import ProgressCallback, TranscriptionEngine
 
 logger = logging.getLogger(__name__)
+_SPANISH_CHARACTERS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZÑÁÉÍÓÚÜ"
+    "abcdefghijklmnopqrstuvwxyzñáéíóúü"
+    "0123456789.,;:!?…¿¡'’\"()[]{}-–—"
+)
 
 
 class FasterWhisperEngine(TranscriptionEngine):
@@ -56,18 +62,39 @@ class FasterWhisperEngine(TranscriptionEngine):
                         "Transcribiendo audio…",
                         min(100.0, float(segment.end) / float(info.duration) * 100),
                     )
-                words = tuple(
-                    Word(
-                        text=word.word.strip(),
-                        start=max(0.0, float(word.start)),
-                        end=max(float(word.start), float(word.end)),
-                        confidence=float(word.probability)
-                        if word.probability is not None
-                        else None,
-                    )
-                    for word in (segment.words or [])
-                    if word.word.strip()
-                )
+                words_list: list[Word] = []
+                for word in segment.words or []:
+                    text = unicodedata.normalize("NFC", word.word.strip())
+                    if info.language.casefold() == "es":
+                        cleaned_text = "".join(
+                            character
+                            for character in text
+                            if character in _SPANISH_CHARACTERS
+                        )
+                        if cleaned_text != text:
+                            removed = " ".join(
+                                f"U+{ord(character):04X}"
+                                for character in text
+                                if character not in _SPANISH_CHARACTERS
+                            )
+                            logger.warning(
+                                "Whisper produjo caracteres fuera del alfabeto español "
+                                "en una palabra; se eliminaron: %s",
+                                removed,
+                            )
+                        text = cleaned_text
+                    if text:
+                        words_list.append(
+                            Word(
+                                text=text,
+                                start=max(0.0, float(word.start)),
+                                end=max(float(word.start), float(word.end)),
+                                confidence=float(word.probability)
+                                if word.probability is not None
+                                else None,
+                            )
+                        )
+                words = tuple(words_list)
                 if words:
                     converted.append(
                         TranscriptSegment(

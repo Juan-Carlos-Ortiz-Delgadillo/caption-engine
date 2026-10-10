@@ -1,8 +1,13 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtWidgets import QApplication
 
 from app.ass.generator import ASSGenerator
 from app.captions.segmenter import CaptionSegmenter
@@ -32,6 +37,10 @@ class FakeTranscriptionEngine(TranscriptionEngine):
 
 
 class PipelineTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.application = QApplication.instance() or QApplication([])
+
     def test_writes_transcript_ass_srt_and_rendered_video(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

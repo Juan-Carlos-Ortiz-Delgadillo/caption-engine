@@ -11,6 +11,7 @@ from pathlib import Path
 from collections.abc import Callable
 
 from app.ass.generator import ASSGenerator
+from app.captions.balance_text import layout_captions
 from app.captions.segmenter import CaptionSegmenter
 from app.core.exceptions import RenderingError
 from app.editor.models import CaptionEditorProject
@@ -121,10 +122,22 @@ class CaptionApplicationService:
         )
         report("Organizando subtítulos…", 55)
         captions = self._segmenter.segment(transcript, SegmentationOptions())
+        captions, caption_font_sizes = layout_captions(
+            captions,
+            style_config,
+            metadata.width,
+            metadata.height,
+            bold_style=style_id == "bold_highlight",
+        )
         ass_path, srt_path = folder / "captions.ass", folder / "captions.srt"
         ass_path.write_text(
             self._ass.generate(
-                captions, style_id, style_config, metadata.width, metadata.height
+                captions,
+                style_id,
+                style_config,
+                metadata.width,
+                metadata.height,
+                caption_font_sizes=caption_font_sizes,
             ),
             encoding="utf-8",
         )

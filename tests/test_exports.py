@@ -47,6 +47,17 @@ class ExportTests(unittest.TestCase):
         )
         self.assertIn(r"\frz-15", output)
 
+    def test_ass_uses_a_dedicated_style_for_fitted_caption_font_size(self) -> None:
+        output = ASSGenerator().generate(
+            _captions(),
+            "minimal",
+            CaptionStyleConfig(font_size=64, highlight_enabled=False),
+            caption_font_sizes=(56,),
+        )
+
+        self.assertIn("Style: CaptionFit56,Arial,56,&H00FFFFFF,", output)
+        self.assertIn("Dialogue: 0,0:00:00.00,0:00:01.00,CaptionFit56,", output)
+
     def test_ass_maps_typography_bubble_case_and_effects(self) -> None:
         config = CaptionStyleConfig(
             bold=True,

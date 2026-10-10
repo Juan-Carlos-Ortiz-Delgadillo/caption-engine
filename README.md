@@ -50,8 +50,19 @@ Los saltos de línea y el control de interlineado posicionan líneas separadas
 en las coordenadas PlayRes del ASS. libass no ofrece esquinas redondeadas para
 BorderStyle=3, por lo que las burbujas son cuadradas. También incluye controles
 de encuadre/zoom del preview, timeline, undo/redo y guardado automático `.acs`.
-La segmentación automática equilibra las líneas dentro del ancho máximo y evita
-terminarlas en artículos, preposiciones o conjunciones cuando hay otra opción válida.
+La segmentación temporal limita la duración y el tamaño de cada caption. Antes de
+exportar, el ajuste visual mide cada línea con las métricas Qt de la familia y el
+peso tipográfico seleccionados, incorpora contorno, sombra, blur y burbuja, y
+equilibra palabras completas con programación dinámica. El ancho seguro lateral
+se escala con la resolución del video; si no cabe, intenta tamaños de fuente
+desde el configurado hasta 56 px. Si aún no cabe, permite hasta seis líneas y
+parte con guion las palabras que exceden el ancho, con una advertencia en el
+registro. Si no existe una distribución válida, informa la palabra que supera
+el ancho y las dimensiones disponibles en lugar de exportar texto recortado.
+Whisper normaliza Unicode y, cuando detecta español, descarta caracteres fuera
+del alfabeto español con una advertencia. Los saltos de línea se comparten entre
+ASS y SRT. Los saltos y posiciones editados manualmente en el editor siguen
+siendo manuales.
 Los presets de estilo se pueden guardar como JSON. Usa «Exportar ASS/SRT» para
 actualizar los subtítulos o «Renderizar MP4» para producir el video editado. Un
 proyecto `.acs` guardado se puede volver a abrir sin repetir la transcripción.

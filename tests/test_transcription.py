@@ -52,3 +52,59 @@ class FasterWhisperAudioTests(unittest.TestCase):
                 )
         self.assertEqual(result.words[0].text, "local")
         self.assertTrue(factory.call_args.kwargs["local_files_only"])
+
+    def test_spanish_transcription_normalizes_unicode_and_removes_foreign_letters(self) -> None:
+        class Model:
+            def transcribe(self, *_args, **_kwargs):
+                accented_word = type(
+                    "WordData",
+                    (),
+                    {
+                        "word": " man\u0303ana",
+                        "start": 0.0,
+                        "end": 0.2,
+                        "probability": 0.9,
+                    },
+                )()
+                contaminated_word = type(
+                    "WordData",
+                    (),
+                    {
+                        "word": " pendientesạẠồị",
+                        "start": 0.2,
+                        "end": 0.4,
+                        "probability": 0.9,
+                    },
+                )()
+                segment = type(
+                    "Segment",
+                    (),
+                    {
+                        "start": 0.0,
+                        "end": 0.4,
+                        "words": [accented_word, contaminated_word],
+                    },
+                )()
+                info = type(
+                    "Info",
+                    (),
+                    {"duration": 0.4, "language": "es", "language_probability": 1.0},
+                )()
+                return iter([segment]), info
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "input.mp4"
+            source.touch()
+            with (
+                patch("faster_whisper.WhisperModel", return_value=Model()),
+                self.assertLogs(
+                    "app.transcription.faster_whisper_engine", level="WARNING"
+                ),
+            ):
+                result = FasterWhisperEngine().transcribe(
+                    source, TranscriptionOptions(device="cpu")
+                )
+
+        self.assertEqual(
+            tuple(word.text for word in result.words), ("mañana", "pendientes")
+        )

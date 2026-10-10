@@ -13,5 +13,9 @@ class TranscriptionError(CaptionStudioError):
     """No se pudo transcribir el medio."""
 
 
+class CaptionLayoutError(CaptionStudioError):
+    """El texto no cabe en el área de salida con la fuente configurada."""
+
+
 class RenderingError(CaptionStudioError):
     """No se pudo generar el video de salida."""
